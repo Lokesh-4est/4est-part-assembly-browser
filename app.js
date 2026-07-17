@@ -7,7 +7,8 @@ const state = {
   activeTab: "assembly", // "assembly" | "part"
   assemblies: [],        // [{ value, entries: [{modelId, objectRuntimeId}] }] sorted
   parts: [],
-  loaded: false
+  loaded: false,
+  expandedGroups: { assembly: new Set(), part: new Set() }
 };
 
 let API = null;
@@ -51,6 +52,40 @@ function normalizeValue(v) {
 
 function naturalCompare(a, b) {
   return a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" });
+}
+
+// Extracts a group prefix from a value so items can be nested under it.
+// Handles two common naming styles:
+//   "Rib01.01" / "Rib01-01" / "Rib01_01"  -> group "Rib01" (split before last separator)
+//   "LGS001" / "ANGL045" (no separator)   -> group "LGS" / "ANGL" (leading letters)
+// Falls back to using the whole value as its own group if neither pattern fits.
+function getGroupKey(value) {
+  const sepMatch = value.match(/^(.+)[._-][^._-]+$/);
+  if (sepMatch) return sepMatch[1];
+
+  const alphaMatch = value.match(/^([A-Za-z]+)/);
+  if (alphaMatch && alphaMatch[1].length < value.length) return alphaMatch[1];
+
+  return value;
+}
+
+// Groups a flat, already-sorted list of {value, entries} items into
+// [{ group, items: [...], entries: <all entries combined> }], sorted.
+function buildGroups(items) {
+  const map = new Map();
+  for (const item of items) {
+    const key = getGroupKey(item.value);
+    if (!map.has(key)) map.set(key, []);
+    map.get(key).push(item);
+  }
+
+  return Array.from(map.entries())
+    .map(([group, groupItems]) => ({
+      group,
+      items: groupItems,
+      entries: groupItems.flatMap(it => it.entries)
+    }))
+    .sort((a, b) => naturalCompare(a.group, b.group));
 }
 
 /* ---------- Object enumeration (same multi-strategy approach as the search tool) ---------- */
@@ -174,12 +209,13 @@ async function buildLists() {
   renderActiveList();
 }
 
-/* ---------- Rendering ---------- */
+/* ---------- Rendering (collapsible group tree) ---------- */
 
 function renderActiveList() {
   const items = state.activeTab === "assembly" ? state.assemblies : state.parts;
   const listEl = state.activeTab === "assembly" ? el("assemblyList") : el("partList");
   const filter = el("filterInput").value.trim().toLowerCase();
+  const expanded = state.expandedGroups[state.activeTab];
 
   const filtered = filter
     ? items.filter(it => it.value.toLowerCase().includes(filter))
@@ -192,36 +228,95 @@ function renderActiveList() {
     el("emptyState").textContent = items.length
       ? "No matches for that filter."
       : `No ${state.activeTab === "assembly" ? "Assembly/Cast unit position" : "PART Position"} values found in this model.`;
+    el("assemblyCount").textContent = state.assemblies.length ? `(${state.assemblies.length})` : "";
+    el("partCount").textContent = state.parts.length ? `(${state.parts.length})` : "";
     return;
   }
   el("emptyState").hidden = true;
 
-  for (const item of filtered) {
-    const li = document.createElement("li");
+  const groups = buildGroups(filtered);
+  // While actively filtering, auto-expand every group that has a match so
+  // results are visible without needing a manual click.
+  const forceExpand = Boolean(filter);
+
+  for (const groupData of groups) {
+    const isExpanded = forceExpand || expanded.has(groupData.group);
+
+    const groupLi = document.createElement("li");
+    groupLi.className = "group-row";
+
+    const arrow = document.createElement("span");
+    arrow.className = "arrow" + (isExpanded ? " open" : "");
+    arrow.textContent = "\u25b6";
+    groupLi.appendChild(arrow);
+
     const label = document.createElement("span");
-    label.textContent = item.value;
-    li.appendChild(label);
+    label.className = "group-label";
+    label.textContent = groupData.group;
+    groupLi.appendChild(label);
 
-    if (item.entries.length > 1) {
-      const badge = document.createElement("span");
-      badge.className = "dupe-badge";
-      badge.textContent = `${item.entries.length}\u00d7`;
-      li.appendChild(badge);
+    const countBadge = document.createElement("span");
+    countBadge.className = "group-count";
+    countBadge.textContent = groupData.items.length;
+    groupLi.appendChild(countBadge);
+
+    // Clicking the arrow toggles expand/collapse only.
+    arrow.addEventListener("click", (e) => {
+      e.stopPropagation();
+      if (expanded.has(groupData.group)) {
+        expanded.delete(groupData.group);
+      } else {
+        expanded.add(groupData.group);
+      }
+      renderActiveList();
+    });
+
+    // Clicking the group name/row selects & zooms to every item in the group.
+    groupLi.addEventListener("click", () => selectAndZoomGroup(groupData));
+
+    listEl.appendChild(groupLi);
+
+    if (isExpanded) {
+      const childList = document.createElement("ul");
+      childList.className = "group-children";
+
+      for (const item of groupData.items) {
+        const li = document.createElement("li");
+        li.className = "leaf-row";
+
+        const leafLabel = document.createElement("span");
+        leafLabel.textContent = item.value;
+        li.appendChild(leafLabel);
+
+        if (item.entries.length > 1) {
+          const badge = document.createElement("span");
+          badge.className = "dupe-badge";
+          badge.textContent = `${item.entries.length}\u00d7`;
+          li.appendChild(badge);
+        }
+
+        li.addEventListener("click", (e) => {
+          e.stopPropagation();
+          selectAndZoom(item);
+        });
+        childList.appendChild(li);
+      }
+
+      listEl.appendChild(childList);
     }
-
-    li.addEventListener("click", () => selectAndZoom(item));
-    listEl.appendChild(li);
   }
 
   el("assemblyCount").textContent = state.assemblies.length ? `(${state.assemblies.length})` : "";
   el("partCount").textContent = state.parts.length ? `(${state.parts.length})` : "";
 }
 
-async function selectAndZoom(item) {
+function clearSelectionHighlight() {
   document.querySelectorAll(".list li").forEach(li => li.classList.remove("selected"));
+}
 
+async function applySelector(entries, resultLabel) {
   const byModel = new Map();
-  for (const e of item.entries) {
+  for (const e of entries) {
     if (!byModel.has(e.modelId)) byModel.set(e.modelId, []);
     byModel.get(e.modelId).push(e.objectRuntimeId);
   }
@@ -232,17 +327,34 @@ async function selectAndZoom(item) {
   try {
     await API.viewer.setSelection(selector, "set");
     await API.viewer.setCamera(selector, { animationTime: 800 });
-
-    if (item.entries.length > 1) {
-      setResult(`\u26a0\ufe0f "${item.value}" appears on ${item.entries.length} objects \u2014 selected and zoomed to fit all of them.`, "warn");
-    } else {
-      setResult(`\u2705 Zoomed to "${item.value}".`, "ok");
-    }
-    log("Selection + zoom applied", { value: item.value, count: item.entries.length });
+    return true;
   } catch (err) {
     setResult("Found it, but couldn't select/zoom. Try again.", "error");
     log("setSelection/setCamera failed", err.message);
+    return false;
   }
+}
+
+async function selectAndZoom(item) {
+  clearSelectionHighlight();
+  const ok = await applySelector(item.entries);
+  if (!ok) return;
+
+  if (item.entries.length > 1) {
+    setResult(`\u26a0\ufe0f "${item.value}" appears on ${item.entries.length} objects \u2014 selected and zoomed to fit all of them.`, "warn");
+  } else {
+    setResult(`\u2705 Zoomed to "${item.value}".`, "ok");
+  }
+  log("Selection + zoom applied", { value: item.value, count: item.entries.length });
+}
+
+async function selectAndZoomGroup(groupData) {
+  clearSelectionHighlight();
+  const ok = await applySelector(groupData.entries);
+  if (!ok) return;
+
+  setResult(`\u2705 Selected and zoomed to all ${groupData.items.length} item(s) in "${groupData.group}" (${groupData.entries.length} object(s) total).`, "ok");
+  log("Group selection + zoom applied", { group: groupData.group, itemCount: groupData.items.length, objectCount: groupData.entries.length });
 }
 
 /* ---------- Tabs / filter / refresh ---------- */
