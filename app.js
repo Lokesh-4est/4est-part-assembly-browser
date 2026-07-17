@@ -1,5 +1,5 @@
 const PROPERTY_NAMES = {
-  assembly: "Assembly/Cast unit mark",
+  assembly: "Assembly/Cast unit Mark",
   part: "Part Position"
 };
 
