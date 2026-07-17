@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>4EST Part & Assembly Browser</title>
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+  <main class="wrap">
+    <h1>Part &amp; Assembly Browser</h1>
+
+    <div id="connectionBanner" class="banner muted">Connecting to Trimble Connect...</div>
+
+    <div class="tabs">
+      <button id="tabAssemblies" class="tab active">Assemblies <span id="assemblyCount" class="count"></span></button>
+      <button id="tabParts" class="tab">Parts <span id="partCount" class="count"></span></button>
+    </div>
+
+    <div class="toolbar">
+      <input id="filterInput" placeholder="Filter this list..." />
+      <button id="refreshButton" class="secondary">Refresh</button>
+    </div>
+
+    <div id="loadingState" class="loading" hidden>
+      <div class="spinner"></div>
+      <span id="loadingText">Reading model objects...</span>
+    </div>
+
+    <div id="emptyState" class="empty" hidden></div>
+
+    <ul id="assemblyList" class="list"></ul>
+    <ul id="partList" class="list" hidden></ul>
+
+    <div id="zoomStatus" class="result"></div>
+
+    <details class="card advanced">
+      <summary>Advanced</summary>
+      <div class="adv-block">
+        <div class="label">Project</div>
+        <pre id="projectInfo" class="log">Waiting...</pre>
+      </div>
+      <div class="adv-block">
+        <div class="label">Debug log</div>
+        <pre id="debugLog" class="log">Starting...</pre>
+      </div>
+    </details>
+  </main>
+
+  <script src="https://components.connect.trimble.com/trimble-connect-workspace-api/index.js"></script>
+  <script src="./app.js"></script>
+</body>
+</html>
