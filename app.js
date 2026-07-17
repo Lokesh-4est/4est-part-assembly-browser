@@ -1,6 +1,6 @@
 const PROPERTY_NAMES = {
-  assembly: "Assembly/Cast unit position",
-  part: "PART Position"
+  assembly: "Assembly/Cast unit mark",
+  part: "Part Position"
 };
 
 const state = {
