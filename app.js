@@ -1,14 +1,16 @@
 const PROPERTY_NAMES = {
   assembly: "Assembly/Cast unit Mark",
-  part: "Part Position"
+  part: "Part Position",
+  uniqueId: "Unique ID" // <-- confirm this matches the exact property name in your model
 };
 
 const state = {
-  activeTab: "assembly", // "assembly" | "part"
+  activeTab: "assembly", // "assembly" | "part" | "uniqueId"
   assemblies: [],        // [{ value, entries: [{modelId, objectRuntimeId}] }] sorted
   parts: [],
+  uniqueIds: [],
   loaded: false,
-  expandedGroups: { assembly: new Set(), part: new Set() }
+  expandedGroups: { assembly: new Set(), part: new Set(), uniqueId: new Set() }
 };
 
 let API = null;
@@ -132,7 +134,7 @@ async function getAllModelObjectIds() {
   return [];
 }
 
-/* ---------- Build the two lists by reading PART Position / Assembly position off every object ---------- */
+/* ---------- Build the three lists by reading PART Position / Assembly position / GUID off every object ---------- */
 
 async function buildLists() {
   el("loadingState").hidden = false;
@@ -152,6 +154,7 @@ async function buildLists() {
 
   const assemblyMap = new Map(); // value -> [{modelId, objectRuntimeId}]
   const partMap = new Map();
+  const uniqueIdMap = new Map();
 
   const batchSize = 200;
   let checked = 0;
@@ -171,11 +174,13 @@ async function buildLists() {
         const sets = obj.properties || [];
         let assemblyVal = null;
         let partVal = null;
+        let uniqueIdVal = null;
 
         for (const set of sets) {
           for (const p of set.properties || []) {
             if (!assemblyVal && p.name === PROPERTY_NAMES.assembly) assemblyVal = normalizeValue(p.value);
             if (!partVal && p.name === PROPERTY_NAMES.part) partVal = normalizeValue(p.value);
+            if (!uniqueIdVal && p.name === PROPERTY_NAMES.uniqueId) uniqueIdVal = normalizeValue(p.value);
           }
         }
 
@@ -186,6 +191,10 @@ async function buildLists() {
         if (partVal) {
           if (!partMap.has(partVal)) partMap.set(partVal, []);
           partMap.get(partVal).push({ modelId, objectRuntimeId: obj.id });
+        }
+        if (uniqueIdVal) {
+          if (!uniqueIdMap.has(uniqueIdVal)) uniqueIdMap.set(uniqueIdVal, []);
+          uniqueIdMap.get(uniqueIdVal).push({ modelId, objectRuntimeId: obj.id });
         }
       }
 
@@ -202,8 +211,12 @@ async function buildLists() {
     .map(([value, entries]) => ({ value, entries }))
     .sort((a, b) => naturalCompare(a.value, b.value));
 
+  state.uniqueIds = Array.from(uniqueIdMap.entries())
+    .map(([value, entries]) => ({ value, entries }))
+    .sort((a, b) => naturalCompare(a.value, b.value));
+
   state.loaded = true;
-  log(`Lists built. Checked ${checked} object(s). ${state.assemblies.length} assembly value(s), ${state.parts.length} part value(s).`);
+  log(`Lists built. Checked ${checked} object(s). ${state.assemblies.length} assembly value(s), ${state.parts.length} part value(s), ${state.uniqueIds.length} unique ID value(s).`);
 
   el("loadingState").hidden = true;
   renderActiveList();
@@ -212,8 +225,14 @@ async function buildLists() {
 /* ---------- Rendering (collapsible group tree) ---------- */
 
 function renderActiveList() {
-  const items = state.activeTab === "assembly" ? state.assemblies : state.parts;
-  const listEl = state.activeTab === "assembly" ? el("assemblyList") : el("partList");
+  const items = state.activeTab === "assembly" ? state.assemblies
+    : state.activeTab === "part" ? state.parts
+    : state.uniqueIds;
+
+  const listEl = state.activeTab === "assembly" ? el("assemblyList")
+    : state.activeTab === "part" ? el("partList")
+    : el("uniqueIdList");
+
   const filter = el("filterInput").value.trim().toLowerCase();
   const expanded = state.expandedGroups[state.activeTab];
 
@@ -227,9 +246,14 @@ function renderActiveList() {
     el("emptyState").hidden = false;
     el("emptyState").textContent = items.length
       ? "No matches for that filter."
-      : `No ${state.activeTab === "assembly" ? "Assembly/Cast unit position" : "PART Position"} values found in this model.`;
+      : `No ${
+          state.activeTab === "assembly" ? "Assembly/Cast unit position"
+          : state.activeTab === "part" ? "PART Position"
+          : "Unique ID"
+        } values found in this model.`;
     el("assemblyCount").textContent = state.assemblies.length ? `(${state.assemblies.length})` : "";
     el("partCount").textContent = state.parts.length ? `(${state.parts.length})` : "";
+    el("uniqueIdCount").textContent = state.uniqueIds.length ? `(${state.uniqueIds.length})` : "";
     return;
   }
   el("emptyState").hidden = true;
@@ -308,6 +332,7 @@ function renderActiveList() {
 
   el("assemblyCount").textContent = state.assemblies.length ? `(${state.assemblies.length})` : "";
   el("partCount").textContent = state.parts.length ? `(${state.parts.length})` : "";
+  el("uniqueIdCount").textContent = state.uniqueIds.length ? `(${state.uniqueIds.length})` : "";
 }
 
 function clearSelectionHighlight() {
@@ -363,8 +388,10 @@ function setActiveTab(tab) {
   state.activeTab = tab;
   el("tabAssemblies").classList.toggle("active", tab === "assembly");
   el("tabParts").classList.toggle("active", tab === "part");
+  el("tabUniqueId").classList.toggle("active", tab === "uniqueId");
   el("assemblyList").hidden = tab !== "assembly";
   el("partList").hidden = tab !== "part";
+  el("uniqueIdList").hidden = tab !== "uniqueId";
   el("filterInput").value = "";
   renderActiveList();
 }
@@ -372,6 +399,7 @@ function setActiveTab(tab) {
 function setupUI() {
   el("tabAssemblies").addEventListener("click", () => setActiveTab("assembly"));
   el("tabParts").addEventListener("click", () => setActiveTab("part"));
+  el("tabUniqueId").addEventListener("click", () => setActiveTab("uniqueId"));
   el("filterInput").addEventListener("input", renderActiveList);
   el("refreshButton").addEventListener("click", () => {
     if (!API) {
