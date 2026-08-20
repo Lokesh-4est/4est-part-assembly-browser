@@ -14,6 +14,13 @@ const state = {
     assembly: new Set(),
     part: new Set(),
     uniqueId: new Set()
+  },
+  // Per-tab, per-group-name -> array of {modelId, objectRuntimeId, color}
+  // currently applied. Used to know toggle state and to revert on turn-off.
+  coloredGroups: {
+    assembly: new Map(),
+    part: new Map(),
+    uniqueId: new Map()
   }
 };
 
@@ -106,6 +113,185 @@ function buildGroups(items) {
       entries: groupItems.flatMap((item) => item.entries)
     }))
     .sort((a, b) => naturalCompare(a.group, b.group));
+}
+
+/* ---------- Random per-assembly colouring ---------- */
+
+function hslToRgb(h, s, l) {
+  s /= 100;
+  l /= 100;
+
+  const k = (n) => (n + h / 30) % 12;
+  const a = s * Math.min(l, 1 - l);
+  const f = (n) =>
+    l - a * Math.max(-1, Math.min(k(n) - 3, Math.min(9 - k(n), 1)));
+
+  return [
+    Math.round(f(0) * 255),
+    Math.round(f(8) * 255),
+    Math.round(f(4) * 255)
+  ];
+}
+
+function randomAssemblyColor() {
+  const hue = Math.floor(Math.random() * 360);
+  const saturation = 55 + Math.random() * 30; // 55-85%
+  const lightness = 42 + Math.random() * 16; // 42-58%
+  const [r, g, b] = hslToRgb(hue, saturation, lightness);
+
+  return { r, g, b, a: 255 };
+}
+
+async function setEntryColor(entry, color) {
+  try {
+    await API.viewer.setObjectState(
+      {
+        modelObjectIds: [
+          {
+            modelId: entry.modelId,
+            objectRuntimeIds: [entry.objectRuntimeId]
+          }
+        ]
+      },
+      { color }
+    );
+    return true;
+  } catch (err) {
+    log(
+      `setObjectState (colour) failed for ${entry.modelId}/${entry.objectRuntimeId}`,
+      err.message
+    );
+    return false;
+  }
+}
+
+async function applyGroupColours(groupData) {
+  // Each entry is one physical assembly instance (confirmed: normal,
+  // non-duplicated assemblies list as exactly 1 entry - multi-part
+  // assemblies are never exploded here). So one random colour per entry
+  // gives every assembly in the dropdown its own colour, and duplicate
+  // marks like "MRB01.03 (2x)" still get two different colours from
+  // each other - all from the single click near MRB01.
+  const assignments = groupData.entries.map((entry) => ({
+    modelId: entry.modelId,
+    objectRuntimeId: entry.objectRuntimeId,
+    color: randomAssemblyColor()
+  }));
+
+  for (const assignment of assignments) {
+    await setEntryColor(assignment, assignment.color);
+  }
+
+  state.coloredGroups[state.activeTab].set(groupData.group, assignments);
+
+  log(`Applied random colours to "${groupData.group}"`, {
+    assembliesColored: assignments.length
+  });
+}
+
+async function clearGroupColours(groupName) {
+  const assignments = state.coloredGroups[state.activeTab].get(groupName);
+  if (!assignments) return;
+
+  for (const assignment of assignments) {
+    await setEntryColor(assignment, "reset");
+  }
+
+  state.coloredGroups[state.activeTab].delete(groupName);
+
+  log(`Cleared colours for "${groupName}"`);
+}
+
+async function toggleGroupColour(groupData, on) {
+  if (on) {
+    setResult(`Applying random colours to "${groupData.group}"...`, "");
+    await applyGroupColours(groupData);
+
+    setResult(
+      `✅ Coloured ${groupData.entries.length} assembly(ies) in "${groupData.group}".`,
+      "ok"
+    );
+  } else {
+    await clearGroupColours(groupData.group);
+    setResult(`Colours cleared for "${groupData.group}".`, "");
+  }
+}
+
+/* ---------- Colour popover ---------- */
+
+let activeColourPopover = null;
+
+function handleOutsideColourClick(event) {
+  if (activeColourPopover && !activeColourPopover.contains(event.target)) {
+    closeColourPopover();
+  }
+}
+
+function closeColourPopover() {
+  if (!activeColourPopover) return;
+
+  activeColourPopover.remove();
+  activeColourPopover = null;
+  document.removeEventListener("click", handleOutsideColourClick, true);
+}
+
+function openColourPopover(anchorEl, groupData) {
+  closeColourPopover();
+
+  const popover = document.createElement("div");
+  popover.className = "colour-popover";
+
+  const title = document.createElement("div");
+  title.className = "colour-popover-title";
+  title.textContent = "Colour";
+  popover.appendChild(title);
+
+  const switchLabel = document.createElement("label");
+  switchLabel.className = "switch";
+
+  const checkbox = document.createElement("input");
+  checkbox.type = "checkbox";
+  checkbox.checked = state.coloredGroups[state.activeTab].has(
+    groupData.group
+  );
+
+  const slider = document.createElement("span");
+  slider.className = "slider";
+
+  switchLabel.appendChild(checkbox);
+  switchLabel.appendChild(slider);
+  popover.appendChild(switchLabel);
+
+  checkbox.addEventListener("click", (event) => {
+    event.stopPropagation();
+  });
+
+  checkbox.addEventListener("change", async () => {
+    checkbox.disabled = true;
+    await toggleGroupColour(groupData, checkbox.checked);
+    checkbox.disabled = false;
+  });
+
+  document.body.appendChild(popover);
+
+  const rect = anchorEl.getBoundingClientRect();
+  const top = rect.bottom + window.scrollY + 4;
+  const left = Math.max(
+    8,
+    Math.min(
+      rect.left + window.scrollX,
+      window.innerWidth - popover.offsetWidth - 12
+    )
+  );
+
+  popover.style.top = `${top}px`;
+  popover.style.left = `${left}px`;
+
+  activeColourPopover = popover;
+
+  setTimeout(() => {
+    document.addEventListener("click", handleOutsideColourClick, true);
+  }, 0);
 }
 
 /* ---------- Full-model object enumeration ---------- */
@@ -389,6 +575,8 @@ async function buildLists() {
 /* ---------- Rendering ---------- */
 
 function renderActiveList() {
+  closeColourPopover();
+
   const items =
     state.activeTab === "assembly" ? state.assemblies :
     state.activeTab === "part" ? state.parts :
@@ -462,6 +650,24 @@ function renderActiveList() {
     countBadge.className = "group-count";
     countBadge.textContent = groupData.items.length;
     groupItem.appendChild(countBadge);
+
+    const colourButton = document.createElement("button");
+    colourButton.type = "button";
+    colourButton.className = "colour-btn";
+    colourButton.title = "Colour";
+    colourButton.setAttribute("aria-label", "Colour");
+    colourButton.textContent = "🎨";
+
+    if (state.coloredGroups[state.activeTab].has(groupData.group)) {
+      colourButton.classList.add("active");
+    }
+
+    colourButton.addEventListener("click", (event) => {
+      event.stopPropagation();
+      openColourPopover(colourButton, groupData);
+    });
+
+    groupItem.appendChild(colourButton);
 
     arrow.addEventListener("click", (event) => {
       event.stopPropagation();
