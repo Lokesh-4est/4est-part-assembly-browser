@@ -308,6 +308,49 @@ async function toggleGroupColour(groupData, on) {
   }
 }
 
+async function colourVisibleGroups() {
+  if (!API) {
+    setResult("Still connecting to Trimble Connect — try again in a moment.", "error");
+    return;
+  }
+
+  const groups = buildBrowserGroups(visibleBrowserItems());
+  if (!groups.length) {
+    setResult("There are no visible groups to colour.", "error");
+    return;
+  }
+
+  const button = el("colourGroupsButton");
+  button.disabled = true;
+  const originalLabel = button.textContent;
+  button.textContent = "…";
+  let coloured = 0;
+  let failed = 0;
+
+  for (const groupData of groups) {
+    try {
+      // One selector and one colour per group: every HME01 member shares a
+      // colour, every JHME01 member shares another, and so on.
+      await API.viewer.setObjectState(selectorFor(groupData.entries), {
+        color: randomAssemblyColor()
+      });
+      coloured += 1;
+    } catch (error) {
+      failed += 1;
+      log(`Group colour failed for ${groupData.group}`, error.message);
+    }
+  }
+
+  setResult(
+    failed
+      ? `Coloured ${coloured} group(s); ${failed} group(s) could not be coloured. Check Advanced → Debug log.`
+      : `Applied one colour to each of ${coloured} visible group(s).`,
+    failed ? "warn" : "ok"
+  );
+  button.disabled = false;
+  button.textContent = originalLabel;
+}
+
 function closeColourPopover() {
   if (!activeColourPopover) return;
   activeColourPopover.remove(); activeColourPopover = null;
@@ -352,19 +395,32 @@ function makeMarkupPick(x, y, z, modelId, objectRuntimeId) {
   return pick;
 }
 
-function textMarkupForBox(modelId, objectRuntimeId, text, box) {
-  const min = box.min;
-  const max = box.max;
-  const centerX = (min.x + max.x) / 2;
-  const centerY = (min.y + max.y) / 2;
-  const topZ = max.z;
-  const leaderLength = Math.max((max.z - min.z) * 0.65, 300);
+function textMarkupForPosition(modelId, objectRuntimeId, text, position) {
+  // getObjectPositions returns metres; MarkupPick coordinates are millimetres.
+  const positionX = position.x * 1000;
+  const positionY = position.y * 1000;
+  const positionZ = position.z * 1000;
 
   return {
     text,
     color: { r: 37, g: 99, b: 235, a: 255 },
-    // The leader starts on the model object. Its label endpoint is deliberately
-    // free in model space so Trimble renders the text next to, not inside, it.
+    start: makeMarkupPick(positionX, positionY, positionZ, modelId, objectRuntimeId),
+    end: makeMarkupPick(positionX, positionY, positionZ + 500)
+  };
+}
+
+function textMarkupForBox(modelId, objectRuntimeId, text, box) {
+  const min = box.min;
+  const max = box.max;
+  // Viewer geometry is expressed in metres, while markup coordinates are mm.
+  const centerX = ((min.x + max.x) / 2) * 1000;
+  const centerY = ((min.y + max.y) / 2) * 1000;
+  const topZ = max.z * 1000;
+  const leaderLength = Math.max((max.z - min.z) * 650, 300);
+
+  return {
+    text,
+    color: { r: 37, g: 99, b: 235, a: 255 },
     start: makeMarkupPick(centerX, centerY, topZ, modelId, objectRuntimeId),
     end: makeMarkupPick(centerX, centerY, topZ + leaderLength)
   };
@@ -391,15 +447,32 @@ async function getTagMarkups(items) {
   for (const [modelId, entries] of byModel) {
     for (let index = 0; index < entries.length; index += 200) {
       const batch = entries.slice(index, index + 200);
-      const boxes = await API.viewer.getObjectBoundingBoxes(
-        modelId,
-        batch.map((entry) => entry.objectRuntimeId)
-      );
-      const boxesById = new Map((boxes || []).map((item) => [item.id, item.boundingBox]));
+      const ids = batch.map((entry) => entry.objectRuntimeId);
+      let positionsById = new Map();
+      let boxesById = new Map();
+
+      try {
+        const positions = await API.viewer.getObjectPositions(modelId, ids);
+        positionsById = new Map((positions || []).map((item) => [item.id, item.position]));
+      } catch (error) {
+        log(`Object positions unavailable for ${modelId}; using bounding boxes`, error.message);
+      }
+
+      const entriesWithoutPosition = batch.filter((entry) => !positionsById.has(entry.objectRuntimeId));
+      if (entriesWithoutPosition.length) {
+        const boxes = await API.viewer.getObjectBoundingBoxes(
+          modelId,
+          entriesWithoutPosition.map((entry) => entry.objectRuntimeId)
+        );
+        boxesById = new Map((boxes || []).map((item) => [item.id, item.boundingBox]));
+      }
 
       for (const entry of batch) {
+        const position = positionsById.get(entry.objectRuntimeId);
         const box = boxesById.get(entry.objectRuntimeId);
-        if (box?.min && box?.max) {
+        if (position) {
+          markups.push(textMarkupForPosition(modelId, entry.objectRuntimeId, entry.text, position));
+        } else if (box?.min && box?.max) {
           markups.push(textMarkupForBox(modelId, entry.objectRuntimeId, entry.text, box));
         } else {
           log("No bounding box available for tag", { modelId, objectRuntimeId: entry.objectRuntimeId, text: entry.text });
@@ -608,6 +681,7 @@ function setupUI() {
   }));
   el("filterInput").addEventListener("input", renderBrowser);
   el("refreshButton").addEventListener("click", refreshModel);
+  el("colourGroupsButton").addEventListener("click", colourVisibleGroups);
   el("tagButton").addEventListener("click", tagCurrentList);
   el("deleteMarkupsButton").addEventListener("click", deleteAllMarkups);
   el("findButton").addEventListener("click", searchLocator);
