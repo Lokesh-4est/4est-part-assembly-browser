@@ -1,54 +1,78 @@
 <!doctype html>
-<html lang="en"> 
+<html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>4EST Part & Assembly Browser</title>
-  <link rel="stylesheet" href="./style.css" />
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>4EST Parts &amp; Assembly Browser</title>
+  <link rel="stylesheet" href="./style.css">
 </head>
 <body>
   <main class="wrap">
-    <h1>Part &amp; Assembly Browser</h1>
+    <header class="page-header">
+      <h1>Parts &amp; Assembly Browser</h1>
+      <p id="connectionBanner" class="banner muted">Connecting to Trimble Connect…</p>
+    </header>
 
-    <div id="connectionBanner" class="banner muted">Connecting to Trimble Connect...</div>
+    <section class="card locator" aria-labelledby="locatorTitle">
+      <div class="section-heading">
+        <div>
+          <h2 id="locatorTitle">Drawing &amp; Item Locator</h2>
+          <p>Find a drawing number, mark, SKU, or position anywhere in the loaded model.</p>
+        </div>
+      </div>
+      <div class="search-mode" role="radiogroup" aria-label="Search mode">
+        <label><input type="radio" name="searchMode" value="full" checked> Full Match</label>
+        <label><input type="radio" name="searchMode" value="partial"> Partial Match</label>
+      </div>
+      <div class="search-row">
+        <input id="locatorInput" type="search" placeholder="Enter a drawing number, mark, SKU, or position">
+        <button id="findButton" type="button"><span class="btn-label">Find &amp; Zoom</span></button>
+      </div>
+      <div id="partialMatchResults" class="partial-match-results" hidden></div>
+    </section>
 
-    <div class="tabs">
-      <button id="tabAssemblies" class="tab active">Assemblies <span id="assemblyCount" class="count"></span></button>
-      <button id="tabParts" class="tab">Parts <span id="partCount" class="count"></span></button>
-      <button id="tabUniqueId" class="tab">Unique ID <span id="uniqueIdCount" class="count"></span></button>
-    </div>
+    <section class="card browser" aria-labelledby="browserTitle">
+      <div class="section-heading browser-heading">
+        <div>
+          <h2 id="browserTitle">Model Browser</h2>
+          <p>Browse and select model objects by their saved properties.</p>
+        </div>
+        <button id="refreshButton" class="secondary" type="button">Refresh model</button>
+      </div>
+      <div class="tabs" role="tablist" aria-label="Browser list">
+        <button class="tab active" type="button" data-tab="assembly" role="tab">Assemblies <span id="assemblyCount"></span></button>
+        <button class="tab" type="button" data-tab="part" role="tab">Parts <span id="partCount"></span></button>
+        <button class="tab" type="button" data-tab="uniqueId" role="tab">Unique ID <span id="uniqueIdCount"></span></button>
+      </div>
+      <input id="filterInput" type="search" placeholder="Filter the current list…">
+      <div id="loadingState" class="loading" hidden><span class="spinner"></span><span id="loadingText">Reading model objects…</span></div>
+      <div id="emptyState" class="empty" hidden></div>
+      <ul id="browserList" class="browser-list" aria-label="Model objects"></ul>
+    </section>
 
-    <div class="toolbar">
-      <input id="filterInput" placeholder="Filter this list..." />
-      <button id="refreshButton" class="secondary">Refresh</button>
-    </div>
-
-    <div id="loadingState" class="loading" hidden>
-      <div class="spinner"></div>
-      <span id="loadingText">Reading model objects...</span>
-    </div>
-
-    <div id="emptyState" class="empty" hidden></div>
-
-    <ul id="assemblyList" class="list"></ul>
-    <ul id="partList" class="list" hidden></ul>
-    <ul id="uniqueIdList" class="list" hidden></ul>
-
-    <div id="zoomStatus" class="result"></div>
+    <div id="status" class="result" role="status"></div>
 
     <details class="card advanced">
       <summary>Advanced</summary>
-      <div class="adv-block">
-        <div class="label">Project</div>
-        <pre id="projectInfo" class="log">Waiting...</pre>
+      <div class="advanced-block">
+        <div class="label">Drawing number from link</div>
+        <div id="drawingNoValue">Checking…</div>
+        <div id="drawingNoSource" class="hint"></div>
       </div>
-      <div class="adv-block">
+      <div class="advanced-block">
+        <button id="inspectButton" class="secondary" type="button">Inspect selected part properties</button>
+        <p class="hint">Select a part in the viewer, then inspect its property names in the debug log.</p>
+      </div>
+      <div class="advanced-block">
+        <div class="label">Project</div>
+        <pre id="projectInfo" class="log">Waiting…</pre>
+      </div>
+      <div class="advanced-block">
         <div class="label">Debug log</div>
-        <pre id="debugLog" class="log">Starting...</pre>
+        <pre id="debugLog" class="log">Starting…</pre>
       </div>
     </details>
   </main>
-
   <script src="https://components.connect.trimble.com/trimble-connect-workspace-api/index.js"></script>
   <script src="./app.js"></script>
 </body>
