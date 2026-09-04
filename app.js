@@ -4,930 +4,424 @@ const PROPERTY_NAMES = {
   uniqueId: "Unique ID"
 };
 
+let API = null;
+let pendingBridgeDrawingNo = "";
+let lastBridgeDrawingNo = "";
+let activeColourPopover = null;
+
 const state = {
   activeTab: "assembly",
   assemblies: [],
   parts: [],
   uniqueIds: [],
-  loaded: false,
-  expandedGroups: {
-    assembly: new Set(),
-    part: new Set(),
-    uniqueId: new Set()
-  },
-  // Per-tab, per-group-name -> array of {modelId, objectRuntimeId, color}
-  // currently applied. Used to know toggle state and to revert on turn-off.
-  coloredGroups: {
-    assembly: new Map(),
-    part: new Map(),
-    uniqueId: new Map()
-  }
+  modelObjects: [],
+  partialMatches: [],
+  expandedGroups: { assembly: new Set(), part: new Set(), uniqueId: new Set() },
+  expandedPartialGroups: new Set(),
+  coloredGroups: { assembly: new Map(), part: new Map(), uniqueId: new Map() }
 };
 
-let API = null;
-
-function el(id) {
-  return document.getElementById(id);
-}
+function el(id) { return document.getElementById(id); }
+function normalize(value) { return String(value ?? "").trim().toLowerCase(); }
+function display(value) { return String(value ?? "").trim(); }
+function naturalCompare(a, b) { return a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" }); }
 
 function log(label, data) {
   const box = el("debugLog");
   if (!box) return;
-
-  const time = new Date().toLocaleTimeString();
-  const line = data !== undefined
-    ? `[${time}] ${label}\n${JSON.stringify(data, null, 2)}\n`
-    : `[${time}] ${label}\n`;
-
-  box.textContent = line + "\n" + box.textContent;
+  const details = data === undefined ? "" : `\n${JSON.stringify(data, null, 2)}`;
+  box.textContent = `[${new Date().toLocaleTimeString()}] ${label}${details}\n\n${box.textContent}`;
 }
 
-function setConnectionBanner(text, kind) {
+function setConnectionBanner(text, kind = "muted") {
   const banner = el("connectionBanner");
-  if (!banner) return;
-
   banner.textContent = text;
-  banner.className = "banner " + (
-    kind === "ok" ? "ok" :
-    kind === "error" ? "error" :
-    "muted"
-  );
+  banner.className = `banner ${kind}`;
+  if (kind === "ok") setTimeout(() => banner.classList.add("fade"), 2000);
+}
 
-  if (kind === "ok") {
-    setTimeout(() => {
-      if (banner.textContent === "Connected") {
-        banner.classList.add("fade");
-      }
-    }, 2000);
+function setResult(message = "", kind = "") {
+  const target = el("status");
+  target.textContent = message;
+  target.className = `result ${kind}`;
+}
+
+function uniqueIds(values) {
+  return [...new Set(values.map(Number).filter(Number.isFinite))];
+}
+
+function flattenRuntimeIds(items) {
+  if (!Array.isArray(items)) return [];
+  return items.flatMap((item) => {
+    if (typeof item === "number") return [item];
+    if (!item || typeof item !== "object") return [];
+    return [item.runtimeId, item.id, ...flattenRuntimeIds(item.children)].filter(Boolean);
+  });
+}
+
+async function getAllModelObjectIds() {
+  try {
+    const objects = await API.viewer.getObjects({});
+    const result = (objects || []).map((model) => ({
+      modelId: model.modelId,
+      objectRuntimeIds: uniqueIds([...(model.objectRuntimeIds || []), ...flattenRuntimeIds(model.objects)])
+    })).filter((model) => model.modelId && model.objectRuntimeIds.length);
+    if (result.length) return result;
+  } catch (error) { log("Full-model getObjects({}) failed", error.message); }
+
+  try {
+    const models = await API.viewer.getModels();
+    const result = [];
+    for (const model of models || []) {
+      try {
+        const hierarchy = await API.viewer.getHierarchyChildren(model.id, [], undefined, true);
+        const ids = uniqueIds(flattenRuntimeIds(hierarchy));
+        if (ids.length) result.push({ modelId: model.id, objectRuntimeIds: ids });
+      } catch (error) { log(`Hierarchy read failed for ${model.id}`, error.message); }
+    }
+    if (result.length) return result;
+  } catch (error) { log("getModels() failed", error.message); }
+
+  try {
+    const selection = await API.viewer.getSelection();
+    return (selection || []).map((model) => ({
+      modelId: model.modelId,
+      objectRuntimeIds: uniqueIds(model.objectRuntimeIds || [])
+    })).filter((model) => model.modelId && model.objectRuntimeIds.length);
+  } catch (error) { log("getSelection() fallback failed", error.message); return []; }
+}
+
+function mapPropertyValues(object, modelId, maps) {
+  for (const propertySet of object.properties || []) {
+    for (const property of propertySet.properties || []) {
+      const value = display(property.value);
+      if (!value) continue;
+      const key = property.name === PROPERTY_NAMES.assembly ? "assembly" :
+        property.name === PROPERTY_NAMES.part ? "part" :
+        property.name === PROPERTY_NAMES.uniqueId ? "uniqueId" : null;
+      if (!key) continue;
+      if (!maps[key].has(value)) maps[key].set(value, []);
+      maps[key].get(value).push({ modelId, objectRuntimeId: object.id });
+    }
   }
 }
 
-function setResult(message, kind) {
-  const status = el("zoomStatus");
-  if (!status) return;
+async function refreshModel() {
+  if (!API) return;
+  el("loadingState").hidden = false;
+  el("emptyState").hidden = true;
+  el("loadingText").textContent = "Reading complete model…";
+  setResult();
+  clearPartialResults();
 
-  status.textContent = message;
-  status.className = "result " + (kind || "");
-}
+  const modelObjects = await getAllModelObjectIds();
+  const total = modelObjects.reduce((sum, model) => sum + model.objectRuntimeIds.length, 0);
+  if (!total) {
+    el("loadingState").hidden = true;
+    el("emptyState").hidden = false;
+    el("emptyState").textContent = "Couldn't read any objects from the complete model. Check Advanced → Debug log.";
+    return;
+  }
 
-function normalizeValue(value) {
-  return String(value === undefined || value === null ? "" : value).trim();
-}
+  const maps = { assembly: new Map(), part: new Map(), uniqueId: new Map() };
+  let completed = 0;
+  for (const { modelId, objectRuntimeIds } of modelObjects) {
+    for (let index = 0; index < objectRuntimeIds.length; index += 200) {
+      const batch = objectRuntimeIds.slice(index, index + 200);
+      try {
+        const objects = await API.viewer.getObjectProperties(modelId, batch);
+        for (const object of objects || []) mapPropertyValues(object, modelId, maps);
+      } catch (error) { log(`Property read failed for ${modelId}, batch ${index}`, error.message); }
+      completed += batch.length;
+      el("loadingText").textContent = `Reading complete model… (${completed}/${total})`;
+    }
+  }
 
-function naturalCompare(a, b) {
-  return a.localeCompare(b, undefined, {
-    numeric: true,
-    sensitivity: "base"
-  });
+  state.modelObjects = modelObjects;
+  state.assemblies = [...maps.assembly].map(([value, entries]) => ({ value, entries })).sort((a, b) => naturalCompare(a.value, b.value));
+  state.parts = [...maps.part].map(([value, entries]) => ({ value, entries })).sort((a, b) => naturalCompare(a.value, b.value));
+  state.uniqueIds = [...maps.uniqueId].map(([value, entries]) => ({ value, entries })).sort((a, b) => naturalCompare(a.value, b.value));
+  el("loadingState").hidden = true;
+  renderBrowser();
+  log("Model browser refreshed", { objects: completed, assemblies: state.assemblies.length, parts: state.parts.length, uniqueIds: state.uniqueIds.length });
 }
 
 function getGroupKey(value) {
-  const separatorMatch = value.match(/^(.+)[._-][^._-]+$/);
-  if (separatorMatch) return separatorMatch[1];
-
-  const alphaMatch = value.match(/^([A-Za-z]+)/);
-  if (alphaMatch && alphaMatch[1].length < value.length) {
-    return alphaMatch[1];
-  }
-
-  return value;
+  const separator = value.match(/^(.+)[._-][^._-]+$/);
+  if (separator) return separator[1];
+  const prefix = value.match(/^([A-Za-z]+)/);
+  return prefix && prefix[1].length < value.length ? prefix[1] : value;
 }
 
-function buildGroups(items) {
-  const map = new Map();
-
+function buildBrowserGroups(items) {
+  const grouped = new Map();
   for (const item of items) {
-    const key = getGroupKey(item.value);
-
-    if (!map.has(key)) {
-      map.set(key, []);
-    }
-
-    map.get(key).push(item);
+    const group = getGroupKey(item.value);
+    if (!grouped.has(group)) grouped.set(group, []);
+    grouped.get(group).push(item);
   }
-
-  return Array.from(map.entries())
-    .map(([group, groupItems]) => ({
-      group,
-      items: groupItems,
-      entries: groupItems.flatMap((item) => item.entries)
-    }))
+  return [...grouped].map(([group, children]) => ({ group, items: children, entries: children.flatMap((item) => item.entries) }))
     .sort((a, b) => naturalCompare(a.group, b.group));
 }
 
-/* ---------- Random per-assembly colouring ---------- */
-
-function hslToRgb(h, s, l) {
-  s /= 100;
-  l /= 100;
-
-  const k = (n) => (n + h / 30) % 12;
-  const a = s * Math.min(l, 1 - l);
-  const f = (n) =>
-    l - a * Math.max(-1, Math.min(k(n) - 3, Math.min(9 - k(n), 1)));
-
-  return [
-    Math.round(f(0) * 255),
-    Math.round(f(8) * 255),
-    Math.round(f(4) * 255)
-  ];
+function currentItems() {
+  return state.activeTab === "assembly" ? state.assemblies : state.activeTab === "part" ? state.parts : state.uniqueIds;
 }
 
-function randomAssemblyColor() {
-  const hue = Math.floor(Math.random() * 360);
-  const saturation = 55 + Math.random() * 30; // 55-85%
-  const lightness = 42 + Math.random() * 16; // 42-58%
-  const [r, g, b] = hslToRgb(hue, saturation, lightness);
-
-  return { r, g, b, a: 255 };
+function renderCounts() {
+  el("assemblyCount").textContent = state.assemblies.length ? `(${state.assemblies.length})` : "";
+  el("partCount").textContent = state.parts.length ? `(${state.parts.length})` : "";
+  el("uniqueIdCount").textContent = state.uniqueIds.length ? `(${state.uniqueIds.length})` : "";
 }
 
-async function setEntryColor(entry, color) {
+function selectorFor(entries) {
+  const byModel = new Map();
+  for (const entry of entries) {
+    if (!byModel.has(entry.modelId)) byModel.set(entry.modelId, []);
+    byModel.get(entry.modelId).push(entry.objectRuntimeId ?? entry.objectId);
+  }
+  return { modelObjectIds: [...byModel].map(([modelId, objectRuntimeIds]) => ({ modelId, objectRuntimeIds: uniqueIds(objectRuntimeIds) })) };
+}
+
+async function selectAndZoom(entries, message) {
   try {
-    await API.viewer.setObjectState(
-      {
-        modelObjectIds: [
-          {
-            modelId: entry.modelId,
-            objectRuntimeIds: [entry.objectRuntimeId]
-          }
-        ]
-      },
-      { color }
-    );
-    return true;
-  } catch (err) {
-    log(
-      `setObjectState (colour) failed for ${entry.modelId}/${entry.objectRuntimeId}`,
-      err.message
-    );
-    return false;
+    const selector = selectorFor(entries);
+    await API.viewer.setSelection(selector, "set");
+    await API.viewer.setCamera(selector, { animationTime: 800 });
+    setResult(message, "ok");
+  } catch (error) {
+    setResult("Found the object(s), but couldn't select or zoom. Try again.", "error");
+    log("setSelection/setCamera failed", error.message);
   }
 }
 
-async function applyGroupColours(groupData) {
-  // Each entry is one physical assembly instance (confirmed: normal,
-  // non-duplicated assemblies list as exactly 1 entry - multi-part
-  // assemblies are never exploded here). So one random colour per entry
-  // gives every assembly in the dropdown its own colour, and duplicate
-  // marks like "MRB01.03 (2x)" still get two different colours from
-  // each other - all from the single click near MRB01.
-  const assignments = groupData.entries.map((entry) => ({
-    modelId: entry.modelId,
-    objectRuntimeId: entry.objectRuntimeId,
-    color: randomAssemblyColor()
-  }));
-
-  for (const assignment of assignments) {
-    await setEntryColor(assignment, assignment.color);
+function renderBrowser() {
+  closeColourPopover();
+  renderCounts();
+  const list = el("browserList");
+  list.replaceChildren();
+  const filter = normalize(el("filterInput").value);
+  const items = currentItems();
+  const filtered = filter ? items.filter((item) => normalize(item.value).includes(filter)) : items;
+  if (!filtered.length) {
+    el("emptyState").hidden = false;
+    el("emptyState").textContent = items.length ? "No matches for that filter." : "No values of this type were found in this model.";
+    return;
   }
-
-  state.coloredGroups[state.activeTab].set(groupData.group, assignments);
-
-  log(`Applied random colours to "${groupData.group}"`, {
-    assembliesColored: assignments.length
-  });
-}
-
-async function clearGroupColours(groupName) {
-  const assignments = state.coloredGroups[state.activeTab].get(groupName);
-  if (!assignments) return;
-
-  for (const assignment of assignments) {
-    await setEntryColor(assignment, "reset");
-  }
-
-  state.coloredGroups[state.activeTab].delete(groupName);
-
-  log(`Cleared colours for "${groupName}"`);
-}
-
-async function toggleGroupColour(groupData, on) {
-  if (on) {
-    setResult(`Applying random colours to "${groupData.group}"...`, "");
-    await applyGroupColours(groupData);
-
-    setResult(
-      `✅ Coloured ${groupData.entries.length} assembly(ies) in "${groupData.group}".`,
-      "ok"
-    );
-  } else {
-    await clearGroupColours(groupData.group);
-    setResult(`Colours cleared for "${groupData.group}".`, "");
+  el("emptyState").hidden = true;
+  const expanded = state.expandedGroups[state.activeTab];
+  for (const groupData of buildBrowserGroups(filtered)) {
+    const open = Boolean(filter) || expanded.has(groupData.group);
+    const row = document.createElement("li"); row.className = "group-row";
+    const arrow = document.createElement("button"); arrow.className = `arrow ${open ? "open" : ""}`; arrow.textContent = "▶"; arrow.setAttribute("aria-label", "Expand group");
+    arrow.addEventListener("click", (event) => { event.stopPropagation(); open ? expanded.delete(groupData.group) : expanded.add(groupData.group); renderBrowser(); });
+    const label = document.createElement("span"); label.className = "group-label"; label.textContent = groupData.group;
+    const count = document.createElement("span"); count.className = "group-count"; count.textContent = groupData.items.length;
+    const colour = document.createElement("button"); colour.className = `colour-button ${state.coloredGroups[state.activeTab].has(groupData.group) ? "active" : ""}`; colour.textContent = "Colour"; colour.type = "button";
+    colour.addEventListener("click", (event) => { event.stopPropagation(); openColourPopover(colour, groupData); });
+    row.append(arrow, label, count, colour);
+    row.addEventListener("click", () => selectAndZoom(groupData.entries, `Selected ${groupData.entries.length} object(s) in "${groupData.group}".`));
+    list.append(row);
+    if (!open) continue;
+    const children = document.createElement("ul"); children.className = "group-children";
+    for (const item of groupData.items) {
+      const child = document.createElement("li"); child.className = "leaf-row";
+      const text = document.createElement("span"); text.textContent = item.value; child.append(text);
+      if (item.entries.length > 1) { const duplicates = document.createElement("span"); duplicates.className = "dupe-badge"; duplicates.textContent = `${item.entries.length}×`; child.append(duplicates); }
+      child.addEventListener("click", (event) => { event.stopPropagation(); selectAndZoom(item.entries, `Zoomed to "${item.value}".`); });
+      children.append(child);
+    }
+    list.append(children);
   }
 }
 
-/* ---------- Colour popover ---------- */
+function randomColour() {
+  const hue = Math.floor(Math.random() * 360);
+  const chroma = 0.55, x = chroma * (1 - Math.abs((hue / 60) % 2 - 1)), m = 0.2;
+  const channels = hue < 60 ? [chroma, x, 0] : hue < 120 ? [x, chroma, 0] : hue < 180 ? [0, chroma, x] : hue < 240 ? [0, x, chroma] : hue < 300 ? [x, 0, chroma] : [chroma, 0, x];
+  return { r: Math.round((channels[0] + m) * 255), g: Math.round((channels[1] + m) * 255), b: Math.round((channels[2] + m) * 255), a: 255 };
+}
 
-let activeColourPopover = null;
+async function setObjectColour(entry, colour) {
+  await API.viewer.setObjectState({ modelObjectIds: [{ modelId: entry.modelId, objectRuntimeIds: [entry.objectRuntimeId] }] }, { color: colour });
+}
 
-function handleOutsideColourClick(event) {
-  if (activeColourPopover && !activeColourPopover.contains(event.target)) {
-    closeColourPopover();
-  }
+async function toggleColours(groupData, enabled) {
+  const colors = state.coloredGroups[state.activeTab];
+  try {
+    if (enabled) {
+      const assignments = groupData.entries.map((entry) => ({ ...entry, colour: randomColour() }));
+      for (const assignment of assignments) await setObjectColour(assignment, assignment.colour);
+      colors.set(groupData.group, assignments);
+      setResult(`Coloured ${assignments.length} object(s) in "${groupData.group}".`, "ok");
+    } else {
+      for (const assignment of colors.get(groupData.group) || []) await setObjectColour(assignment, "reset");
+      colors.delete(groupData.group);
+      setResult(`Colours cleared for "${groupData.group}".`);
+    }
+    renderBrowser();
+  } catch (error) { setResult("Couldn't update object colours.", "error"); log("Colour update failed", error.message); }
 }
 
 function closeColourPopover() {
   if (!activeColourPopover) return;
-
-  activeColourPopover.remove();
-  activeColourPopover = null;
-  document.removeEventListener("click", handleOutsideColourClick, true);
+  activeColourPopover.remove(); activeColourPopover = null;
+  document.removeEventListener("click", closeColourPopover, true);
 }
 
-function openColourPopover(anchorEl, groupData) {
+function openColourPopover(anchor, groupData) {
   closeColourPopover();
-
-  const popover = document.createElement("div");
-  popover.className = "colour-popover";
-
-  const title = document.createElement("div");
-  title.className = "colour-popover-title";
-  title.textContent = "Colour";
-  popover.appendChild(title);
-
-  const switchLabel = document.createElement("label");
-  switchLabel.className = "switch";
-
-  const checkbox = document.createElement("input");
-  checkbox.type = "checkbox";
-  checkbox.checked = state.coloredGroups[state.activeTab].has(
-    groupData.group
-  );
-
-  const slider = document.createElement("span");
-  slider.className = "slider";
-
-  switchLabel.appendChild(checkbox);
-  switchLabel.appendChild(slider);
-  popover.appendChild(switchLabel);
-
-  checkbox.addEventListener("click", (event) => {
-    event.stopPropagation();
-  });
-
-  checkbox.addEventListener("change", async () => {
-    checkbox.disabled = true;
-    await toggleGroupColour(groupData, checkbox.checked);
-    checkbox.disabled = false;
-  });
-
-  document.body.appendChild(popover);
-
-  const rect = anchorEl.getBoundingClientRect();
-  const top = rect.bottom + window.scrollY + 4;
-  const left = Math.max(
-    8,
-    Math.min(
-      rect.left + window.scrollX,
-      window.innerWidth - popover.offsetWidth - 12
-    )
-  );
-
-  popover.style.top = `${top}px`;
-  popover.style.left = `${left}px`;
-
-  activeColourPopover = popover;
-
-  setTimeout(() => {
-    document.addEventListener("click", handleOutsideColourClick, true);
-  }, 0);
+  const popup = document.createElement("div"); popup.className = "colour-popover";
+  const label = document.createElement("label"); label.textContent = "Colour group";
+  const toggle = document.createElement("input"); toggle.type = "checkbox"; toggle.checked = state.coloredGroups[state.activeTab].has(groupData.group);
+  toggle.addEventListener("click", (event) => event.stopPropagation());
+  toggle.addEventListener("change", async () => { toggle.disabled = true; await toggleColours(groupData, toggle.checked); toggle.disabled = false; });
+  label.append(toggle); popup.append(label); document.body.append(popup);
+  const rect = anchor.getBoundingClientRect(); popup.style.top = `${rect.bottom + window.scrollY + 4}px`; popup.style.left = `${Math.max(8, rect.left + window.scrollX - 90)}px`;
+  activeColourPopover = popup; setTimeout(() => document.addEventListener("click", closeColourPopover, true));
 }
 
-/* ---------- Full-model object enumeration ---------- */
+function clearPartialResults() { state.partialMatches = []; state.expandedPartialGroups.clear(); el("partialMatchResults").replaceChildren(); el("partialMatchResults").hidden = true; }
 
-async function getAllModelObjectIds() {
-  function flattenRuntimeIds(objects) {
-    if (!Array.isArray(objects)) return [];
-
-    return objects.flatMap((item) => {
-      if (typeof item === "number") return [item];
-      if (!item || typeof item !== "object") return [];
-
-      return [
-        item.runtimeId,
-        item.id,
-        ...flattenRuntimeIds(item.children || [])
-      ];
-    });
+function buildPartialGroups(matches) {
+  const values = new Map();
+  for (const match of matches) {
+    const key = `${match.property}\u0000${match.value}`;
+    if (!values.has(key)) values.set(key, { property: match.property, value: match.value, entries: [] });
+    const item = values.get(key);
+    if (!item.entries.some((entry) => entry.modelId === match.modelId && entry.objectRuntimeId === match.objectRuntimeId)) item.entries.push(match);
   }
+  const groups = new Map();
+  for (const item of values.values()) { if (!groups.has(item.property)) groups.set(item.property, []); groups.get(item.property).push(item); }
+  return [...groups].map(([group, items]) => ({ group, items: items.sort((a, b) => naturalCompare(a.value, b.value)) })).sort((a, b) => naturalCompare(a.group, b.group));
+}
 
-  function uniqueRuntimeIds(values) {
-    return [
-      ...new Set(
-        values
-          .map(Number)
-          .filter((id) => Number.isFinite(id))
-      )
-    ];
-  }
-
-  // Full loaded model. {} explicitly means no selection filter.
-  try {
-    const modelObjects = await API.viewer.getObjects({});
-
-    const fullModelResult = (modelObjects || [])
-      .map((model) => ({
-        modelId: model.modelId,
-        objectRuntimeIds: uniqueRuntimeIds([
-          ...(model.objectRuntimeIds || []),
-          ...flattenRuntimeIds(model.objects || [])
-        ])
-      }))
-      .filter((model) =>
-        model.modelId &&
-        model.objectRuntimeIds.length > 0
-      );
-
-    log(
-      "Full-model getObjects({}) result",
-      fullModelResult.map((model) => ({
-        modelId: model.modelId,
-        count: model.objectRuntimeIds.length
-      }))
-    );
-
-    if (fullModelResult.length) {
-      return fullModelResult;
+function renderPartialResults() {
+  const container = el("partialMatchResults"); container.replaceChildren();
+  const list = document.createElement("ul"); list.className = "partial-list";
+  for (const groupData of buildPartialGroups(state.partialMatches)) {
+    const open = state.expandedPartialGroups.has(groupData.group);
+    const row = document.createElement("li"); row.className = "partial-group-row";
+    const arrow = document.createElement("button"); arrow.className = `arrow ${open ? "open" : ""}`; arrow.textContent = "▶"; arrow.setAttribute("aria-label", "Expand results");
+    arrow.addEventListener("click", () => { open ? state.expandedPartialGroups.delete(groupData.group) : state.expandedPartialGroups.add(groupData.group); renderPartialResults(); });
+    const label = document.createElement("span"); label.className = "group-label"; label.textContent = groupData.group;
+    const count = document.createElement("span"); count.className = "group-count"; count.textContent = groupData.items.length;
+    row.append(arrow, label, count); list.append(row);
+    if (!open) continue;
+    const children = document.createElement("ul"); children.className = "group-children";
+    for (const item of groupData.items) {
+      const child = document.createElement("li"); child.className = "leaf-row"; child.textContent = item.value;
+      if (item.entries.length > 1) { const duplicates = document.createElement("span"); duplicates.className = "dupe-badge"; duplicates.textContent = `${item.entries.length}×`; child.append(duplicates); }
+      child.addEventListener("click", () => selectAndZoom(item.entries, `Zoomed to "${item.value}".`)); children.append(child);
     }
-  } catch (err) {
-    log("Full-model getObjects({}) failed", err.message);
+    list.append(children);
   }
+  container.append(list); container.hidden = false;
+}
 
-  // Full-model hierarchy fallback.
+async function searchLocator() {
+  if (!API) return setResult("Still connecting to Trimble Connect — try again in a moment.", "error");
+  const target = display(el("locatorInput").value);
+  if (!target) return setResult("Type a drawing number, mark, SKU, or position first.", "error");
+  const partial = document.querySelector('input[name="searchMode"]:checked')?.value === "partial";
+  const button = el("findButton"); button.disabled = true; button.querySelector(".btn-label").textContent = "Searching…";
+  clearPartialResults(); setResult();
+  const found = [];
   try {
-    const models = await API.viewer.getModels();
-    const hierarchyResult = [];
-
-    for (const model of models || []) {
-      try {
-        const hierarchy = await API.viewer.getHierarchyChildren(
-          model.id,
-          [],
-          undefined,
-          true
-        );
-
-        const ids = uniqueRuntimeIds(
-          flattenRuntimeIds(hierarchy || [])
-        );
-
-        if (ids.length) {
-          hierarchyResult.push({
-            modelId: model.id,
-            objectRuntimeIds: ids
-          });
-
-          log(`Hierarchy retrieved for ${model.name || model.id}`, {
-            modelId: model.id,
-            count: ids.length
-          });
+    for (const { modelId, objectRuntimeIds } of await getAllModelObjectIds()) {
+      for (let index = 0; index < objectRuntimeIds.length; index += 200) {
+        const objects = await API.viewer.getObjectProperties(modelId, objectRuntimeIds.slice(index, index + 200));
+        for (const object of objects || []) {
+          propertySets: for (const propertySet of object.properties || []) {
+            for (const property of propertySet.properties || []) {
+              const propertyValue = normalize(property.value);
+              const matches = partial ? propertyValue.includes(normalize(target)) : propertyValue === normalize(target);
+              if (matches) {
+                found.push({ modelId, objectRuntimeId: object.id, property: property.name || "Other", value: display(property.value) });
+                break propertySets;
+              }
+            }
+          }
         }
-      } catch (err) {
-        log(
-          `Hierarchy read failed for ${model.id}`,
-          err.message
-        );
       }
     }
+    if (!found.length) return setResult(`Couldn't find anything matching "${target}".`, "error");
+    if (partial) { state.partialMatches = found; renderPartialResults(); return setResult(`Found ${found.length} partial match${found.length === 1 ? "" : "es"}. Choose a value below to select and zoom.`, "ok"); }
+    await selectAndZoom(found, found.length === 1 ? `Zoomed to "${target}".` : `Selected and zoomed to ${found.length} matching object(s).`);
+  } catch (error) { setResult("Search failed. Check Advanced → Debug log.", "error"); log("Locator search failed", error.message); }
+  finally { button.disabled = false; button.querySelector(".btn-label").textContent = "Find & Zoom"; }
+}
 
-    if (hierarchyResult.length) {
-      return hierarchyResult;
-    }
-  } catch (err) {
-    log("getModels() failed", err.message);
+function setDrawingNo(value, source) {
+  el("drawingNoValue").textContent = value || "NOT RECEIVED";
+  el("drawingNoSource").textContent = `Source: ${source}`;
+  if (value && !el("locatorInput").value.trim()) el("locatorInput").value = value;
+}
+
+function detectDrawingNo() {
+  const sources = [
+    ["extension URL", window.location.href],
+    ["document referrer", document.referrer]
+  ];
+  for (const [source, url] of sources) {
+    try {
+      const drawingNo = new URL(url).searchParams.get("drawingNo")?.trim();
+      if (drawingNo) { setDrawingNo(drawingNo, source); return; }
+    } catch { /* An unavailable or non-URL referrer is not an error. */ }
   }
+  setDrawingNo("", "No drawing number found in accessible link sources");
+}
 
-  // Selection is used only if full-model enumeration is unavailable.
+async function runPendingBridgeSearch() {
+  if (!API || !pendingBridgeDrawingNo || pendingBridgeDrawingNo === lastBridgeDrawingNo) return;
+  const drawingNo = pendingBridgeDrawingNo; pendingBridgeDrawingNo = ""; lastBridgeDrawingNo = drawingNo;
+  el("locatorInput").value = drawingNo; setDrawingNo(drawingNo, "4EST Drawing Locator Bridge"); await searchLocator();
+}
+
+window.addEventListener("message", (event) => {
+  if (event.origin !== "https://web.connect.trimble.com") return;
+  if (event.data?.type !== "4est-drawing-locator:open-drawing" || typeof event.data.drawingNo !== "string" || !event.data.drawingNo.trim()) return;
+  pendingBridgeDrawingNo = event.data.drawingNo.trim(); runPendingBridgeSearch();
+});
+
+async function inspectSelection() {
   try {
     const selection = await API.viewer.getSelection();
-
-    const selectedResult = (selection || [])
-      .map((model) => ({
-        modelId: model.modelId,
-        objectRuntimeIds: uniqueRuntimeIds(
-          model.objectRuntimeIds || []
-        )
-      }))
-      .filter((model) =>
-        model.modelId &&
-        model.objectRuntimeIds.length > 0
-      );
-
-    if (selectedResult.length) {
-      log(
-        "Using selected objects only as fallback",
-        selectedResult
-      );
-      return selectedResult;
+    for (const model of selection || []) {
+      const ids = (model.objectRuntimeIds || []).slice(0, 5);
+      if (ids.length) log(`Properties for ${model.modelId}`, await API.viewer.getObjectProperties(model.modelId, ids));
     }
-  } catch (err) {
-    log("getSelection() fallback failed", err.message);
-  }
-
-  return [];
-}
-
-/* ---------- Build lists ---------- */
-
-async function buildLists() {
-  el("loadingState").hidden = false;
-  el("emptyState").hidden = true;
-  setResult("");
-  el("loadingText").textContent = "Reading complete model...";
-
-  const modelObjectSets = await getAllModelObjectIds();
-
-  const totalObjects = modelObjectSets.reduce(
-    (sum, set) => sum + set.objectRuntimeIds.length,
-    0
-  );
-
-  if (!totalObjects) {
-    el("loadingState").hidden = true;
-    el("emptyState").hidden = false;
-    el("emptyState").textContent =
-      "Couldn't read any objects from the complete model. " +
-      "Open Advanced → Debug log and check the full-model refresh result.";
-    return;
-  }
-
-  const assemblyMap = new Map();
-  const partMap = new Map();
-  const uniqueIdMap = new Map();
-
-  const batchSize = 200;
-  let checked = 0;
-
-  for (const { modelId, objectRuntimeIds } of modelObjectSets) {
-    for (let index = 0; index < objectRuntimeIds.length; index += batchSize) {
-      const batch = objectRuntimeIds.slice(index, index + batchSize);
-      let propsList;
-
-      try {
-        propsList = await API.viewer.getObjectProperties(modelId, batch);
-      } catch (err) {
-        log(
-          `getObjectProperties failed for ${modelId}, batch ${index}`,
-          err.message
-        );
-        continue;
-      }
-
-      for (const object of propsList || []) {
-        const sets = object.properties || [];
-        let assemblyValue = null;
-        let partValue = null;
-        let uniqueIdValue = null;
-
-        for (const set of sets) {
-          for (const property of set.properties || []) {
-            if (
-              !assemblyValue &&
-              property.name === PROPERTY_NAMES.assembly
-            ) {
-              assemblyValue = normalizeValue(property.value);
-            }
-
-            if (
-              !partValue &&
-              property.name === PROPERTY_NAMES.part
-            ) {
-              partValue = normalizeValue(property.value);
-            }
-
-            if (
-              !uniqueIdValue &&
-              property.name === PROPERTY_NAMES.uniqueId
-            ) {
-              uniqueIdValue = normalizeValue(property.value);
-            }
-          }
-        }
-
-        if (assemblyValue) {
-          if (!assemblyMap.has(assemblyValue)) {
-            assemblyMap.set(assemblyValue, []);
-          }
-
-          assemblyMap.get(assemblyValue).push({
-            modelId,
-            objectRuntimeId: object.id
-          });
-        }
-
-        if (partValue) {
-          if (!partMap.has(partValue)) {
-            partMap.set(partValue, []);
-          }
-
-          partMap.get(partValue).push({
-            modelId,
-            objectRuntimeId: object.id
-          });
-        }
-
-        if (uniqueIdValue) {
-          if (!uniqueIdMap.has(uniqueIdValue)) {
-            uniqueIdMap.set(uniqueIdValue, []);
-          }
-
-          uniqueIdMap.get(uniqueIdValue).push({
-            modelId,
-            objectRuntimeId: object.id
-          });
-        }
-      }
-
-      checked += batch.length;
-      el("loadingText").textContent =
-        `Reading complete model... (${checked}/${totalObjects})`;
-    }
-  }
-
-  state.assemblies = Array.from(assemblyMap.entries())
-    .map(([value, entries]) => ({ value, entries }))
-    .sort((a, b) => naturalCompare(a.value, b.value));
-
-  state.parts = Array.from(partMap.entries())
-    .map(([value, entries]) => ({ value, entries }))
-    .sort((a, b) => naturalCompare(a.value, b.value));
-
-  state.uniqueIds = Array.from(uniqueIdMap.entries())
-    .map(([value, entries]) => ({ value, entries }))
-    .sort((a, b) => naturalCompare(a.value, b.value));
-
-  state.loaded = true;
-
-  log(
-    `Lists built. Checked ${checked} object(s).`,
-    {
-      assemblies: state.assemblies.length,
-      parts: state.parts.length,
-      uniqueIds: state.uniqueIds.length
-    }
-  );
-
-  el("loadingState").hidden = true;
-  renderActiveList();
-}
-
-/* ---------- Rendering ---------- */
-
-function renderActiveList() {
-  closeColourPopover();
-
-  const items =
-    state.activeTab === "assembly" ? state.assemblies :
-    state.activeTab === "part" ? state.parts :
-    state.uniqueIds;
-
-  const listElement =
-    state.activeTab === "assembly" ? el("assemblyList") :
-    state.activeTab === "part" ? el("partList") :
-    el("uniqueIdList");
-
-  const filter = el("filterInput").value.trim().toLowerCase();
-  const expanded = state.expandedGroups[state.activeTab];
-
-  const filtered = filter
-    ? items.filter((item) => item.value.toLowerCase().includes(filter))
-    : items;
-
-  listElement.innerHTML = "";
-
-  if (!filtered.length) {
-    el("emptyState").hidden = false;
-
-    el("emptyState").textContent = items.length
-      ? "No matches for that filter."
-      : `No ${
-          state.activeTab === "assembly"
-            ? "Assembly/Cast unit position"
-            : state.activeTab === "part"
-              ? "PART Position"
-              : "Unique ID"
-        } values found in this model.`;
-
-    el("assemblyCount").textContent = state.assemblies.length
-      ? `(${state.assemblies.length})`
-      : "";
-
-    el("partCount").textContent = state.parts.length
-      ? `(${state.parts.length})`
-      : "";
-
-    el("uniqueIdCount").textContent = state.uniqueIds.length
-      ? `(${state.uniqueIds.length})`
-      : "";
-
-    return;
-  }
-
-  el("emptyState").hidden = true;
-
-  const groups = buildGroups(filtered);
-  const forceExpand = Boolean(filter);
-
-  for (const groupData of groups) {
-    const isExpanded =
-      forceExpand || expanded.has(groupData.group);
-
-    const groupItem = document.createElement("li");
-    groupItem.className = "group-row";
-
-    const arrow = document.createElement("span");
-    arrow.className = "arrow" + (isExpanded ? " open" : "");
-    arrow.textContent = "▶";
-    groupItem.appendChild(arrow);
-
-    const label = document.createElement("span");
-    label.className = "group-label";
-    label.textContent = groupData.group;
-    groupItem.appendChild(label);
-
-    const countBadge = document.createElement("span");
-    countBadge.className = "group-count";
-    countBadge.textContent = groupData.items.length;
-    groupItem.appendChild(countBadge);
-
-    const colourButton = document.createElement("button");
-    colourButton.type = "button";
-    colourButton.className = "colour-btn";
-    colourButton.title = "Colour";
-    colourButton.setAttribute("aria-label", "Colour");
-    colourButton.textContent = "🎨";
-
-    if (state.coloredGroups[state.activeTab].has(groupData.group)) {
-      colourButton.classList.add("active");
-    }
-
-    colourButton.addEventListener("click", (event) => {
-      event.stopPropagation();
-      openColourPopover(colourButton, groupData);
-    });
-
-    groupItem.appendChild(colourButton);
-
-    arrow.addEventListener("click", (event) => {
-      event.stopPropagation();
-
-      if (expanded.has(groupData.group)) {
-        expanded.delete(groupData.group);
-      } else {
-        expanded.add(groupData.group);
-      }
-
-      renderActiveList();
-    });
-
-    groupItem.addEventListener("click", () => {
-      selectAndZoomGroup(groupData);
-    });
-
-    listElement.appendChild(groupItem);
-
-    if (isExpanded) {
-      const childList = document.createElement("ul");
-      childList.className = "group-children";
-
-      for (const item of groupData.items) {
-        const itemElement = document.createElement("li");
-        itemElement.className = "leaf-row";
-
-        const itemLabel = document.createElement("span");
-        itemLabel.textContent = item.value;
-        itemElement.appendChild(itemLabel);
-
-        if (item.entries.length > 1) {
-          const duplicateBadge = document.createElement("span");
-          duplicateBadge.className = "dupe-badge";
-          duplicateBadge.textContent = `${item.entries.length}×`;
-          itemElement.appendChild(duplicateBadge);
-        }
-
-        itemElement.addEventListener("click", (event) => {
-          event.stopPropagation();
-          selectAndZoom(item);
-        });
-
-        childList.appendChild(itemElement);
-      }
-
-      listElement.appendChild(childList);
-    }
-  }
-
-  el("assemblyCount").textContent = state.assemblies.length
-    ? `(${state.assemblies.length})`
-    : "";
-
-  el("partCount").textContent = state.parts.length
-    ? `(${state.parts.length})`
-    : "";
-
-  el("uniqueIdCount").textContent = state.uniqueIds.length
-    ? `(${state.uniqueIds.length})`
-    : "";
-}
-
-function clearSelectionHighlight() {
-  document
-    .querySelectorAll(".list li")
-    .forEach((item) => item.classList.remove("selected"));
-}
-
-async function applySelector(entries) {
-  const byModel = new Map();
-
-  for (const entry of entries) {
-    if (!byModel.has(entry.modelId)) {
-      byModel.set(entry.modelId, []);
-    }
-
-    byModel.get(entry.modelId).push(entry.objectRuntimeId);
-  }
-
-  const selector = {
-    modelObjectIds: Array.from(byModel.entries()).map(
-      ([modelId, objectRuntimeIds]) => ({
-        modelId,
-        objectRuntimeIds
-      })
-    )
-  };
-
-  try {
-    await API.viewer.setSelection(selector, "set");
-    await API.viewer.setCamera(selector, {
-      animationTime: 800
-    });
-
-    return true;
-  } catch (err) {
-    setResult(
-      "Found it, but couldn't select or zoom. Try again.",
-      "error"
-    );
-
-    log("setSelection/setCamera failed", err.message);
-    return false;
-  }
-}
-
-async function selectAndZoom(item) {
-  clearSelectionHighlight();
-
-  const ok = await applySelector(item.entries);
-  if (!ok) return;
-
-  if (item.entries.length > 1) {
-    setResult(
-      `⚠️ "${item.value}" appears on ${item.entries.length} objects — selected and zoomed to fit all of them.`,
-      "warn"
-    );
-  } else {
-    setResult(`✅ Zoomed to "${item.value}".`, "ok");
-  }
-
-  log("Selection and zoom applied", {
-    value: item.value,
-    count: item.entries.length
-  });
-}
-
-async function selectAndZoomGroup(groupData) {
-  clearSelectionHighlight();
-
-  const ok = await applySelector(groupData.entries);
-  if (!ok) return;
-
-  setResult(
-    `✅ Selected and zoomed to all ${groupData.items.length} item(s) in "${groupData.group}" (${groupData.entries.length} object(s) total).`,
-    "ok"
-  );
-
-  log("Group selection and zoom applied", {
-    group: groupData.group,
-    itemCount: groupData.items.length,
-    objectCount: groupData.entries.length
-  });
-}
-
-/* ---------- Tabs, filter, refresh ---------- */
-
-function setActiveTab(tab) {
-  state.activeTab = tab;
-
-  el("tabAssemblies").classList.toggle(
-    "active",
-    tab === "assembly"
-  );
-
-  el("tabParts").classList.toggle(
-    "active",
-    tab === "part"
-  );
-
-  el("tabUniqueId").classList.toggle(
-    "active",
-    tab === "uniqueId"
-  );
-
-  el("assemblyList").hidden = tab !== "assembly";
-  el("partList").hidden = tab !== "part";
-  el("uniqueIdList").hidden = tab !== "uniqueId";
-
-  el("filterInput").value = "";
-  renderActiveList();
+    setResult("Properties were added to the debug log.", "ok");
+  } catch (error) { setResult("Couldn't read the selected part's properties.", "error"); log("Inspect selection failed", error.message); }
 }
 
 function setupUI() {
-  el("tabAssemblies").addEventListener("click", () => {
-    setActiveTab("assembly");
-  });
-
-  el("tabParts").addEventListener("click", () => {
-    setActiveTab("part");
-  });
-
-  el("tabUniqueId").addEventListener("click", () => {
-    setActiveTab("uniqueId");
-  });
-
-  el("filterInput").addEventListener(
-    "input",
-    renderActiveList
-  );
-
-  el("refreshButton").addEventListener("click", () => {
-    if (!API) {
-      setResult(
-        "Still connecting — try again in a moment.",
-        "error"
-      );
-      return;
-    }
-
-    buildLists();
-  });
+  document.querySelectorAll("[data-tab]").forEach((button) => button.addEventListener("click", () => {
+    state.activeTab = button.dataset.tab;
+    document.querySelectorAll("[data-tab]").forEach((tab) => tab.classList.toggle("active", tab === button));
+    el("filterInput").value = ""; renderBrowser();
+  }));
+  el("filterInput").addEventListener("input", renderBrowser);
+  el("refreshButton").addEventListener("click", refreshModel);
+  el("findButton").addEventListener("click", searchLocator);
+  el("locatorInput").addEventListener("keydown", (event) => { if (event.key === "Enter") searchLocator(); });
+  el("inspectButton").addEventListener("click", inspectSelection);
 }
-
-/* ---------- Connection ---------- */
 
 async function connectToTrimble() {
   try {
-    if (!window.TrimbleConnectWorkspace) {
-      setConnectionBanner(
-        "Couldn't load the Trimble connection. Try refreshing the page.",
-        "error"
-      );
-
-      log("TrimbleConnectWorkspace object missing.");
-      return;
-    }
-
-    API = await TrimbleConnectWorkspace.connect(
-      window.parent,
-      (event, data) => {
-        log("Workspace event: " + event, data);
+    if (!window.TrimbleConnectWorkspace) throw new Error("Trimble Connect Workspace API did not load.");
+    API = await TrimbleConnectWorkspace.connect(window.parent, (event, data) => {
+      log(`Workspace event: ${event}`, data);
+      if (event === "extension.command") {
+        const match = String(typeof data === "string" ? data : JSON.stringify(data)).match(/drawingNo=([^&"'\s]+)/i);
+        if (match?.[1]) { pendingBridgeDrawingNo = decodeURIComponent(match[1]); setDrawingNo(pendingBridgeDrawingNo, "extension command"); runPendingBridgeSearch(); }
       }
-    );
-
+    });
     setConnectionBanner("Connected", "ok");
-    log("Connected to Workspace API.");
-
-    try {
-      const project = await API.project.getProject();
-      el("projectInfo").textContent = JSON.stringify(
-        project,
-        null,
-        2
-      );
-
-      log("Project loaded", project);
-    } catch (projectError) {
-      el("projectInfo").textContent =
-        "Could not read project yet: " + projectError.message;
-
-      log("Project read failed", projectError.message);
-    }
-
-    await buildLists();
-  } catch (err) {
-    setConnectionBanner(
-      "Couldn't connect to Trimble Connect. Try refreshing the page.",
-      "error"
-    );
-
-    log("Workspace API connection failed", err.message);
-  }
+    try { el("projectInfo").textContent = JSON.stringify(await API.project.getProject(), null, 2); } catch (error) { log("Project read failed", error.message); }
+    await refreshModel(); await runPendingBridgeSearch();
+  } catch (error) { setConnectionBanner("Couldn't connect to Trimble Connect. Try refreshing the page.", "error"); log("Workspace connection failed", error.message); }
 }
 
-(async function main() {
-  el("debugLog").textContent =
-    "Starting 4EST Part & Assembly Browser...";
-
-  setupUI();
-  await connectToTrimble();
-})();
+(async function main() { el("debugLog").textContent = "Starting 4EST Part, Assembly & Drawing Locator…"; setupUI(); detectDrawingNo(); await connectToTrimble(); })();
