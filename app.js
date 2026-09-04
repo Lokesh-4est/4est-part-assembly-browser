@@ -217,7 +217,7 @@ function renderBrowser() {
     arrow.addEventListener("click", (event) => { event.stopPropagation(); open ? expanded.delete(groupData.group) : expanded.add(groupData.group); renderBrowser(); });
     const label = document.createElement("span"); label.className = "group-label"; label.textContent = groupData.group;
     const count = document.createElement("span"); count.className = "group-count"; count.textContent = groupData.items.length;
-    const colour = document.createElement("button"); colour.className = `colour-button ${state.coloredGroups[state.activeTab].has(groupData.group) ? "active" : ""}`; colour.textContent = "Colour"; colour.type = "button";
+    const colour = document.createElement("button"); colour.className = `colour-button ${state.coloredGroups[state.activeTab].has(groupData.group) ? "active" : ""}`; colour.textContent = "🎨"; colour.type = "button"; colour.title = "Colour"; colour.setAttribute("aria-label", "Colour");
     colour.addEventListener("click", (event) => { event.stopPropagation(); openColourPopover(colour, groupData); });
     row.append(arrow, label, count, colour);
     row.addEventListener("click", () => selectAndZoom(groupData.entries, `Selected ${groupData.entries.length} object(s) in "${groupData.group}".`));
@@ -266,7 +266,13 @@ async function toggleColours(groupData, enabled) {
 function closeColourPopover() {
   if (!activeColourPopover) return;
   activeColourPopover.remove(); activeColourPopover = null;
-  document.removeEventListener("click", closeColourPopover, true);
+  document.removeEventListener("click", handleOutsideColourClick, true);
+}
+
+function handleOutsideColourClick(event) {
+  if (activeColourPopover && !activeColourPopover.contains(event.target)) {
+    closeColourPopover();
+  }
 }
 
 function openColourPopover(anchor, groupData) {
@@ -278,7 +284,8 @@ function openColourPopover(anchor, groupData) {
   toggle.addEventListener("change", async () => { toggle.disabled = true; await toggleColours(groupData, toggle.checked); toggle.disabled = false; });
   label.append(toggle); popup.append(label); document.body.append(popup);
   const rect = anchor.getBoundingClientRect(); popup.style.top = `${rect.bottom + window.scrollY + 4}px`; popup.style.left = `${Math.max(8, rect.left + window.scrollX - 90)}px`;
-  activeColourPopover = popup; setTimeout(() => document.addEventListener("click", closeColourPopover, true));
+  activeColourPopover = popup;
+  setTimeout(() => document.addEventListener("click", handleOutsideColourClick, true));
 }
 
 function clearPartialResults() { state.partialMatches = []; state.expandedPartialGroups.clear(); el("partialMatchResults").replaceChildren(); el("partialMatchResults").hidden = true; }
