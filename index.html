@@ -37,7 +37,11 @@
           <h2 id="browserTitle">Model Browser</h2>
           <p>Browse and select model objects by their saved properties.</p>
         </div>
-        <button id="refreshButton" class="secondary" type="button">Refresh model</button>
+        <div class="browser-actions" aria-label="Browser actions">
+          <button id="refreshButton" class="secondary" type="button">Refresh model</button>
+          <button id="tagButton" class="secondary" type="button">Tag current list</button>
+          <button id="deleteMarkupsButton" class="danger" type="button">Delete all markups</button>
+        </div>
       </div>
       <div class="tabs" role="tablist" aria-label="Browser list">
         <button class="tab active" type="button" data-tab="assembly" role="tab">Assemblies <span id="assemblyCount"></span></button>
