@@ -18,7 +18,8 @@ h2 { margin: 0; font-size: 16px; }
 .search-mode { display: flex; gap: 16px; margin: 0 0 10px; font-size: 13px; }
 .search-mode label { display: flex; align-items: center; gap: 5px; cursor: pointer; }
 .search-mode input { accent-color: #1f2937; }
-.search-row, .browser-heading { display: flex; gap: 8px; }
+.search-row, .browser-heading, .browser-actions { display: flex; gap: 8px; }
+.browser-actions { flex-wrap: wrap; justify-content: flex-end; }
 .search-row input, #filterInput { width: 100%; min-width: 0; }
 input { padding: 10px; border: 1px solid #ccd3dd; border-radius: 6px; background: #fff; font-size: 14px; }
 input:focus { outline: 2px solid #93c5fd; outline-offset: 1px; }
@@ -27,6 +28,8 @@ button:hover:not(:disabled) { background: #111827; }
 button:disabled { cursor: default; opacity: .65; }
 button.secondary { border-color: #cbd5e1; background: #fff; color: #1f2937; white-space: nowrap; }
 button.secondary:hover { background: #f1f5f9; }
+button.danger { border-color: #b91c1c; background: #b91c1c; white-space: nowrap; }
+button.danger:hover:not(:disabled) { background: #991b1b; }
 .tabs { display: flex; margin: 0 0 10px; border-bottom: 1px solid #d7dde5; }
 .tab { flex: 1; padding: 10px 6px; border: 0; border-bottom: 2px solid transparent; border-radius: 0; background: transparent; color: #5f6b7a; font-weight: 600; }
 .tab:hover { background: #eef1f5; }
@@ -73,4 +76,4 @@ button.secondary:hover { background: #f1f5f9; }
 .switch input:checked + .slider { background-color: #2563eb; }
 .switch input:checked + .slider::before { transform: translateX(16px); }
 .switch input:disabled + .slider { cursor: default; opacity: .6; }
-@media (max-width: 480px) { .wrap { padding: 12px; } .browser-heading { align-items: start; } .search-row { flex-direction: column; } .search-row button { width: 100%; } .tab { font-size: 12px; } }
+@media (max-width: 560px) { .wrap { padding: 12px; } .browser-heading { align-items: start; flex-direction: column; } .browser-actions { justify-content: flex-start; } .search-row { flex-direction: column; } .search-row button { width: 100%; } .tab { font-size: 12px; } }
