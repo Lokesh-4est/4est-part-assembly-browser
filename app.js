@@ -16,6 +16,7 @@ const state = {
   uniqueIds: [],
   modelObjects: [],
   partialMatches: [],
+  tagMarkupIds: [],
   expandedGroups: { assembly: new Set(), part: new Set(), uniqueId: new Set() },
   expandedPartialGroups: new Set(),
   coloredGroups: { assembly: new Map(), part: new Map(), uniqueId: new Map() }
@@ -168,6 +169,16 @@ function currentItems() {
   return state.activeTab === "assembly" ? state.assemblies : state.activeTab === "part" ? state.parts : state.uniqueIds;
 }
 
+function visibleBrowserItems() {
+  const filter = normalize(el("filterInput").value);
+  const items = currentItems();
+  return filter ? items.filter((item) => normalize(item.value).includes(filter)) : items;
+}
+
+function currentBrowserLabel() {
+  return state.activeTab === "assembly" ? "Assembly" : state.activeTab === "part" ? "Part" : "Unique ID";
+}
+
 function renderCounts() {
   el("assemblyCount").textContent = state.assemblies.length ? `(${state.assemblies.length})` : "";
   el("partCount").textContent = state.parts.length ? `(${state.parts.length})` : "";
@@ -200,9 +211,9 @@ function renderBrowser() {
   renderCounts();
   const list = el("browserList");
   list.replaceChildren();
-  const filter = normalize(el("filterInput").value);
   const items = currentItems();
-  const filtered = filter ? items.filter((item) => normalize(item.value).includes(filter)) : items;
+  const filter = normalize(el("filterInput").value);
+  const filtered = visibleBrowserItems();
   if (!filtered.length) {
     el("emptyState").hidden = false;
     el("emptyState").textContent = items.length ? "No matches for that filter." : "No values of this type were found in this model.";
@@ -324,6 +335,140 @@ function openColourPopover(anchor, groupData) {
   popup.style.left = `${Math.max(8, Math.min(rect.left + window.scrollX, window.innerWidth - popup.offsetWidth - 12))}px`;
   activeColourPopover = popup;
   setTimeout(() => document.addEventListener("click", handleOutsideColourClick, true));
+}
+
+function makeMarkupPick(modelId, objectRuntimeId, x, y, z) {
+  return {
+    type: "point",
+    modelId,
+    objectId: objectRuntimeId,
+    positionX: x,
+    positionY: y,
+    positionZ: z
+  };
+}
+
+function textMarkupForBox(modelId, objectRuntimeId, text, box) {
+  const min = box.min;
+  const max = box.max;
+  const centerX = (min.x + max.x) / 2;
+  const centerY = (min.y + max.y) / 2;
+  const topZ = max.z;
+  const leaderLength = Math.max((max.z - min.z) * 0.65, 300);
+
+  return {
+    text,
+    color: { r: 37, g: 99, b: 235, a: 255 },
+    start: makeMarkupPick(modelId, objectRuntimeId, centerX, centerY, topZ),
+    end: makeMarkupPick(modelId, objectRuntimeId, centerX, centerY, topZ + leaderLength)
+  };
+}
+
+async function getTagMarkups(items) {
+  const byModel = new Map();
+  const seen = new Set();
+
+  for (const item of items) {
+    for (const entry of item.entries) {
+      const key = `${entry.modelId}\u0000${entry.objectRuntimeId}\u0000${item.value}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      if (!byModel.has(entry.modelId)) byModel.set(entry.modelId, []);
+      byModel.get(entry.modelId).push({ objectRuntimeId: entry.objectRuntimeId, text: item.value });
+    }
+  }
+
+  const markups = [];
+  for (const [modelId, entries] of byModel) {
+    for (let index = 0; index < entries.length; index += 200) {
+      const batch = entries.slice(index, index + 200);
+      const boxes = await API.viewer.getObjectBoundingBoxes(
+        modelId,
+        batch.map((entry) => entry.objectRuntimeId)
+      );
+      const boxesById = new Map((boxes || []).map((item) => [item.id, item.boundingBox]));
+
+      for (const entry of batch) {
+        const box = boxesById.get(entry.objectRuntimeId);
+        if (box?.min && box?.max) {
+          markups.push(textMarkupForBox(modelId, entry.objectRuntimeId, entry.text, box));
+        } else {
+          log("No bounding box available for tag", { modelId, objectRuntimeId: entry.objectRuntimeId, text: entry.text });
+        }
+      }
+    }
+  }
+  return markups;
+}
+
+async function clearBrowserTags() {
+  if (!state.tagMarkupIds.length) return;
+  await API.markup.removeMarkups(state.tagMarkupIds);
+  state.tagMarkupIds = [];
+}
+
+async function tagCurrentList() {
+  if (!API?.markup?.addTextMarkup) {
+    setResult("Text markups are unavailable in this Trimble Connect session.", "error");
+    return;
+  }
+
+  const items = visibleBrowserItems();
+  if (!items.length) {
+    setResult("There are no visible values to tag.", "error");
+    return;
+  }
+
+  const button = el("tagButton");
+  button.disabled = true;
+  button.textContent = "Tagging…";
+  setResult(`Preparing ${currentBrowserLabel()} tags…`);
+
+  try {
+    await clearBrowserTags();
+    const markups = await getTagMarkups(items);
+    if (!markups.length) {
+      setResult("No tag positions could be created from the current model objects.", "error");
+      return;
+    }
+
+    const added = [];
+    for (let index = 0; index < markups.length; index += 100) {
+      added.push(...await API.markup.addTextMarkup(markups.slice(index, index + 100)));
+    }
+    state.tagMarkupIds = added.map((markup) => markup.id).filter(Number.isFinite);
+    setResult(`Added ${added.length} ${currentBrowserLabel().toLowerCase()} tag${added.length === 1 ? "" : "s"}.`, "ok");
+    log("Browser tags added", { tab: state.activeTab, requested: items.length, markups: added.length });
+  } catch (error) {
+    setResult("Couldn't add the current-list tags. Check Advanced → Debug log.", "error");
+    log("Browser tagging failed", error.message);
+  } finally {
+    button.disabled = false;
+    button.textContent = "Tag current list";
+  }
+}
+
+async function deleteAllMarkups() {
+  if (!API?.markup?.removeMarkups) {
+    setResult("Markup deletion is unavailable in this Trimble Connect session.", "error");
+    return;
+  }
+
+  const button = el("deleteMarkupsButton");
+  button.disabled = true;
+  button.textContent = "Deleting…";
+  try {
+    await API.markup.removeMarkups(undefined);
+    state.tagMarkupIds = [];
+    setResult("Deleted all markups from the 3D viewer.", "ok");
+    log("All viewer markups deleted.");
+  } catch (error) {
+    setResult("Couldn't delete the viewer markups. Check Advanced → Debug log.", "error");
+    log("Delete all markups failed", error.message);
+  } finally {
+    button.disabled = false;
+    button.textContent = "Delete all markups";
+  }
 }
 
 function clearPartialResults() { state.partialMatches = []; state.expandedPartialGroups.clear(); el("partialMatchResults").replaceChildren(); el("partialMatchResults").hidden = true; }
@@ -448,6 +593,8 @@ function setupUI() {
   }));
   el("filterInput").addEventListener("input", renderBrowser);
   el("refreshButton").addEventListener("click", refreshModel);
+  el("tagButton").addEventListener("click", tagCurrentList);
+  el("deleteMarkupsButton").addEventListener("click", deleteAllMarkups);
   el("findButton").addEventListener("click", searchLocator);
   el("locatorInput").addEventListener("keydown", (event) => { if (event.key === "Enter") searchLocator(); });
   el("inspectButton").addEventListener("click", inspectSelection);
