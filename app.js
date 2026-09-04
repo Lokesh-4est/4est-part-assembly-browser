@@ -217,7 +217,8 @@ function renderBrowser() {
     arrow.addEventListener("click", (event) => { event.stopPropagation(); open ? expanded.delete(groupData.group) : expanded.add(groupData.group); renderBrowser(); });
     const label = document.createElement("span"); label.className = "group-label"; label.textContent = groupData.group;
     const count = document.createElement("span"); count.className = "group-count"; count.textContent = groupData.items.length;
-    const colour = document.createElement("button"); colour.className = `colour-button ${state.coloredGroups[state.activeTab].has(groupData.group) ? "active" : ""}`; colour.textContent = "🎨"; colour.type = "button"; colour.title = "Colour"; colour.setAttribute("aria-label", "Colour");
+    const colour = document.createElement("button"); colour.className = "colour-btn"; colour.textContent = "🎨"; colour.type = "button"; colour.title = "Colour"; colour.setAttribute("aria-label", "Colour");
+    if (state.coloredGroups[state.activeTab].has(groupData.group)) colour.classList.add("active");
     colour.addEventListener("click", (event) => { event.stopPropagation(); openColourPopover(colour, groupData); });
     row.append(arrow, label, count, colour);
     row.addEventListener("click", () => selectAndZoom(groupData.entries, `Selected ${groupData.entries.length} object(s) in "${groupData.group}".`));
@@ -235,32 +236,64 @@ function renderBrowser() {
   }
 }
 
-function randomColour() {
+function hslToRgb(h, s, l) {
+  s /= 100;
+  l /= 100;
+  const k = (n) => (n + h / 30) % 12;
+  const a = s * Math.min(l, 1 - l);
+  const f = (n) => l - a * Math.max(-1, Math.min(k(n) - 3, Math.min(9 - k(n), 1)));
+  return [Math.round(f(0) * 255), Math.round(f(8) * 255), Math.round(f(4) * 255)];
+}
+
+function randomAssemblyColor() {
   const hue = Math.floor(Math.random() * 360);
-  const chroma = 0.55, x = chroma * (1 - Math.abs((hue / 60) % 2 - 1)), m = 0.2;
-  const channels = hue < 60 ? [chroma, x, 0] : hue < 120 ? [x, chroma, 0] : hue < 180 ? [0, chroma, x] : hue < 240 ? [0, x, chroma] : hue < 300 ? [x, 0, chroma] : [chroma, 0, x];
-  return { r: Math.round((channels[0] + m) * 255), g: Math.round((channels[1] + m) * 255), b: Math.round((channels[2] + m) * 255), a: 255 };
+  const saturation = 55 + Math.random() * 30;
+  const lightness = 42 + Math.random() * 16;
+  const [r, g, b] = hslToRgb(hue, saturation, lightness);
+  return { r, g, b, a: 255 };
 }
 
-async function setObjectColour(entry, colour) {
-  await API.viewer.setObjectState({ modelObjectIds: [{ modelId: entry.modelId, objectRuntimeIds: [entry.objectRuntimeId] }] }, { color: colour });
-}
-
-async function toggleColours(groupData, enabled) {
-  const colors = state.coloredGroups[state.activeTab];
+async function setEntryColor(entry, color) {
   try {
-    if (enabled) {
-      const assignments = groupData.entries.map((entry) => ({ ...entry, colour: randomColour() }));
-      for (const assignment of assignments) await setObjectColour(assignment, assignment.colour);
-      colors.set(groupData.group, assignments);
-      setResult(`Coloured ${assignments.length} object(s) in "${groupData.group}".`, "ok");
-    } else {
-      for (const assignment of colors.get(groupData.group) || []) await setObjectColour(assignment, "reset");
-      colors.delete(groupData.group);
-      setResult(`Colours cleared for "${groupData.group}".`);
-    }
-    renderBrowser();
-  } catch (error) { setResult("Couldn't update object colours.", "error"); log("Colour update failed", error.message); }
+    await API.viewer.setObjectState(
+      { modelObjectIds: [{ modelId: entry.modelId, objectRuntimeIds: [entry.objectRuntimeId] }] },
+      { color }
+    );
+    return true;
+  } catch (err) {
+    log(`setObjectState (colour) failed for ${entry.modelId}/${entry.objectRuntimeId}`, err.message);
+    return false;
+  }
+}
+
+async function applyGroupColours(groupData) {
+  const assignments = groupData.entries.map((entry) => ({
+    modelId: entry.modelId,
+    objectRuntimeId: entry.objectRuntimeId,
+    color: randomAssemblyColor()
+  }));
+  for (const assignment of assignments) await setEntryColor(assignment, assignment.color);
+  state.coloredGroups[state.activeTab].set(groupData.group, assignments);
+  log(`Applied random colours to "${groupData.group}"`, { assembliesColored: assignments.length });
+}
+
+async function clearGroupColours(groupName) {
+  const assignments = state.coloredGroups[state.activeTab].get(groupName);
+  if (!assignments) return;
+  for (const assignment of assignments) await setEntryColor(assignment, "reset");
+  state.coloredGroups[state.activeTab].delete(groupName);
+  log(`Cleared colours for "${groupName}"`);
+}
+
+async function toggleGroupColour(groupData, on) {
+  if (on) {
+    setResult(`Applying random colours to "${groupData.group}"...`);
+    await applyGroupColours(groupData);
+    setResult(`Coloured ${groupData.entries.length} assembly(ies) in "${groupData.group}".`, "ok");
+  } else {
+    await clearGroupColours(groupData.group);
+    setResult(`Colours cleared for "${groupData.group}".`);
+  }
 }
 
 function closeColourPopover() {
@@ -278,12 +311,17 @@ function handleOutsideColourClick(event) {
 function openColourPopover(anchor, groupData) {
   closeColourPopover();
   const popup = document.createElement("div"); popup.className = "colour-popover";
-  const label = document.createElement("label"); label.textContent = "Colour group";
-  const toggle = document.createElement("input"); toggle.type = "checkbox"; toggle.checked = state.coloredGroups[state.activeTab].has(groupData.group);
-  toggle.addEventListener("click", (event) => event.stopPropagation());
-  toggle.addEventListener("change", async () => { toggle.disabled = true; await toggleColours(groupData, toggle.checked); toggle.disabled = false; });
-  label.append(toggle); popup.append(label); document.body.append(popup);
-  const rect = anchor.getBoundingClientRect(); popup.style.top = `${rect.bottom + window.scrollY + 4}px`; popup.style.left = `${Math.max(8, rect.left + window.scrollX - 90)}px`;
+  const title = document.createElement("div"); title.className = "colour-popover-title"; title.textContent = "Colour";
+  const switchLabel = document.createElement("label"); switchLabel.className = "switch";
+  const checkbox = document.createElement("input"); checkbox.type = "checkbox"; checkbox.checked = state.coloredGroups[state.activeTab].has(groupData.group);
+  const slider = document.createElement("span"); slider.className = "slider";
+  switchLabel.append(checkbox, slider); popup.append(title, switchLabel);
+  checkbox.addEventListener("click", (event) => event.stopPropagation());
+  checkbox.addEventListener("change", async () => { checkbox.disabled = true; await toggleGroupColour(groupData, checkbox.checked); checkbox.disabled = false; });
+  document.body.append(popup);
+  const rect = anchor.getBoundingClientRect();
+  popup.style.top = `${rect.bottom + window.scrollY + 4}px`;
+  popup.style.left = `${Math.max(8, Math.min(rect.left + window.scrollX, window.innerWidth - popup.offsetWidth - 12))}px`;
   activeColourPopover = popup;
   setTimeout(() => document.addEventListener("click", handleOutsideColourClick, true));
 }
