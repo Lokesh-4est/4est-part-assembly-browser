@@ -432,7 +432,11 @@ async function getTagMarkups(items) {
   let totalCandidates = 0;
 
   for (const item of items) {
-    for (const entry of item.entries) {
+    // Unique ID values can belong to several physical model objects. Show one
+    // representative label for that value; assemblies and parts still tag
+    // every matching member.
+    const entriesToTag = state.activeTab === "uniqueId" ? item.entries.slice(0, 1) : item.entries;
+    for (const entry of entriesToTag) {
       const key = `${entry.modelId}\u0000${entry.objectRuntimeId}\u0000${item.value}`;
       if (seen.has(key)) continue;
       seen.add(key);
