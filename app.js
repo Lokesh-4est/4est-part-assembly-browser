@@ -20,7 +20,8 @@ const state = {
   tagMarkupIds: [],
   expandedGroups: { assembly: new Set(), part: new Set(), uniqueId: new Set() },
   expandedPartialGroups: new Set(),
-  coloredGroups: { assembly: new Map(), part: new Map(), uniqueId: new Map() }
+  coloredGroups: { assembly: new Map(), part: new Map(), uniqueId: new Map() },
+  visibleGroupColourSelectors: []
 };
 
 function el(id) { return document.getElementById(id); }
@@ -308,15 +309,17 @@ async function toggleGroupColour(groupData, on) {
   }
 }
 
+function setVisibleGroupColourButton(active) {
+  const button = el("colourGroupsButton");
+  button.classList.toggle("active", active);
+  button.setAttribute("aria-pressed", String(active));
+  button.title = active ? "Reset visible group colours" : "Colour each visible group";
+  button.setAttribute("aria-label", button.title);
+}
+
 async function colourVisibleGroups() {
   if (!API) {
     setResult("Still connecting to Trimble Connect — try again in a moment.", "error");
-    return;
-  }
-
-  const groups = buildBrowserGroups(visibleBrowserItems());
-  if (!groups.length) {
-    setResult("There are no visible groups to colour.", "error");
     return;
   }
 
@@ -324,31 +327,62 @@ async function colourVisibleGroups() {
   button.disabled = true;
   const originalLabel = button.textContent;
   button.textContent = "…";
-  let coloured = 0;
-  let failed = 0;
-
-  for (const groupData of groups) {
-    try {
-      // One selector and one colour per group: every HME01 member shares a
-      // colour, every JHME01 member shares another, and so on.
-      await API.viewer.setObjectState(selectorFor(groupData.entries), {
-        color: randomAssemblyColor()
-      });
-      coloured += 1;
-    } catch (error) {
-      failed += 1;
-      log(`Group colour failed for ${groupData.group}`, error.message);
+  try {
+    if (state.visibleGroupColourSelectors.length) {
+      const remaining = [];
+      let reset = 0;
+      for (const group of state.visibleGroupColourSelectors) {
+        try {
+          await API.viewer.setObjectState(group.selector, { color: "reset" });
+          reset += 1;
+        } catch (error) {
+          remaining.push(group);
+          log(`Group colour reset failed for ${group.name}`, error.message);
+        }
+      }
+      state.visibleGroupColourSelectors = remaining;
+      setVisibleGroupColourButton(remaining.length > 0);
+      setResult(
+        remaining.length
+          ? `Reset ${reset} group(s); ${remaining.length} group(s) could not be reset. Try again.`
+          : `Restored the original model colours for ${reset} group(s).`,
+        remaining.length ? "warn" : "ok"
+      );
+      return;
     }
-  }
 
-  setResult(
-    failed
-      ? `Coloured ${coloured} group(s); ${failed} group(s) could not be coloured. Check Advanced → Debug log.`
-      : `Applied one colour to each of ${coloured} visible group(s).`,
-    failed ? "warn" : "ok"
-  );
-  button.disabled = false;
-  button.textContent = originalLabel;
+    const groups = buildBrowserGroups(visibleBrowserItems());
+    if (!groups.length) {
+      setResult("There are no visible groups to colour.", "error");
+      return;
+    }
+
+    const colouredSelectors = [];
+    let failed = 0;
+    for (const groupData of groups) {
+      try {
+        // One selector and one colour per group: every HME01 member shares a
+        // colour, every JHME01 member shares another, and so on.
+        const selector = selectorFor(groupData.entries);
+        await API.viewer.setObjectState(selector, { color: randomAssemblyColor() });
+        colouredSelectors.push({ name: groupData.group, selector });
+      } catch (error) {
+        failed += 1;
+        log(`Group colour failed for ${groupData.group}`, error.message);
+      }
+    }
+    state.visibleGroupColourSelectors = colouredSelectors;
+    setVisibleGroupColourButton(colouredSelectors.length > 0);
+    setResult(
+      failed
+        ? `Coloured ${colouredSelectors.length} group(s); ${failed} group(s) could not be coloured. Check Advanced → Debug log.`
+        : `Applied one colour to each of ${colouredSelectors.length} visible group(s). Click the palette again to reset them.`,
+      failed ? "warn" : "ok"
+    );
+  } finally {
+    button.disabled = false;
+    button.textContent = originalLabel;
+  }
 }
 
 function closeColourPopover() {
@@ -678,6 +712,7 @@ async function inspectSelection() {
 }
 
 function setupUI() {
+  setVisibleGroupColourButton(false);
   document.querySelectorAll("[data-tab]").forEach((button) => button.addEventListener("click", () => {
     state.activeTab = button.dataset.tab;
     document.querySelectorAll("[data-tab]").forEach((tab) => tab.classList.toggle("active", tab === button));
