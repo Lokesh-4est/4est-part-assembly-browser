@@ -9,6 +9,7 @@ let pendingBridgeDrawingNo = "";
 let lastBridgeDrawingNo = "";
 let activeColourPopover = null;
 const MAX_TAGS_PER_RUN = 100;
+const GROUP_COLOUR_STORAGE_KEY = "4est-parts-browser:visible-group-colours";
 
 const state = {
   activeTab: "assembly",
@@ -21,8 +22,32 @@ const state = {
   expandedGroups: { assembly: new Set(), part: new Set(), uniqueId: new Set() },
   expandedPartialGroups: new Set(),
   coloredGroups: { assembly: new Map(), part: new Map(), uniqueId: new Map() },
-  visibleGroupColourSelectors: []
+  visibleGroupColourSelectors: loadVisibleGroupColourSelectors()
 };
+
+function loadVisibleGroupColourSelectors() {
+  try {
+    const saved = JSON.parse(sessionStorage.getItem(GROUP_COLOUR_STORAGE_KEY) || "[]");
+    return Array.isArray(saved) ? saved.filter((group) =>
+      typeof group?.name === "string" &&
+      Array.isArray(group?.selector?.modelObjectIds)
+    ) : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveVisibleGroupColourSelectors() {
+  try {
+    if (state.visibleGroupColourSelectors.length) {
+      sessionStorage.setItem(GROUP_COLOUR_STORAGE_KEY, JSON.stringify(state.visibleGroupColourSelectors));
+    } else {
+      sessionStorage.removeItem(GROUP_COLOUR_STORAGE_KEY);
+    }
+  } catch {
+    // The in-memory toggle still works if browser storage is unavailable.
+  }
+}
 
 function el(id) { return document.getElementById(id); }
 function normalize(value) { return String(value ?? "").trim().toLowerCase(); }
@@ -341,6 +366,7 @@ async function colourVisibleGroups() {
         }
       }
       state.visibleGroupColourSelectors = remaining;
+      saveVisibleGroupColourSelectors();
       setVisibleGroupColourButton(remaining.length > 0);
       setResult(
         remaining.length
@@ -372,6 +398,7 @@ async function colourVisibleGroups() {
       }
     }
     state.visibleGroupColourSelectors = colouredSelectors;
+    saveVisibleGroupColourSelectors();
     setVisibleGroupColourButton(colouredSelectors.length > 0);
     setResult(
       failed
@@ -712,7 +739,7 @@ async function inspectSelection() {
 }
 
 function setupUI() {
-  setVisibleGroupColourButton(false);
+  setVisibleGroupColourButton(state.visibleGroupColourSelectors.length > 0);
   document.querySelectorAll("[data-tab]").forEach((button) => button.addEventListener("click", () => {
     state.activeTab = button.dataset.tab;
     document.querySelectorAll("[data-tab]").forEach((tab) => tab.classList.toggle("active", tab === button));
