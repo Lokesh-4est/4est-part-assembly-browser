@@ -8,7 +8,6 @@ let API = null;
 let pendingBridgeDrawingNo = "";
 let lastBridgeDrawingNo = "";
 let activeColourPopover = null;
-const MAX_TAGS_PER_RUN = 100;
 const GROUP_COLOUR_STORAGE_KEY = "4est-parts-browser:visible-group-colours";
 
 const state = {
@@ -490,7 +489,6 @@ function textMarkupForBox(modelId, objectRuntimeId, text, box) {
 async function getTagMarkups(items) {
   const byModel = new Map();
   const seen = new Set();
-  let totalCandidates = 0;
 
   for (const item of items) {
     // Unique ID values can belong to several physical model objects. Show one
@@ -501,8 +499,6 @@ async function getTagMarkups(items) {
       const key = `${entry.modelId}\u0000${entry.objectRuntimeId}\u0000${item.value}`;
       if (seen.has(key)) continue;
       seen.add(key);
-      totalCandidates += 1;
-      if (totalCandidates > MAX_TAGS_PER_RUN) continue;
       if (!byModel.has(entry.modelId)) byModel.set(entry.modelId, []);
       byModel.get(entry.modelId).push({ objectRuntimeId: entry.objectRuntimeId, text: item.value });
     }
@@ -545,7 +541,7 @@ async function getTagMarkups(items) {
       }
     }
   }
-  return { markups, skipped: Math.max(0, totalCandidates - MAX_TAGS_PER_RUN) };
+  return { markups };
 }
 
 async function clearBrowserTags() {
@@ -573,7 +569,7 @@ async function tagCurrentList() {
 
   try {
     await clearBrowserTags();
-    const { markups, skipped } = await getTagMarkups(items);
+    const { markups } = await getTagMarkups(items);
     if (!markups.length) {
       setResult("No tag positions could be created from the current model objects.", "error");
       return;
@@ -585,13 +581,8 @@ async function tagCurrentList() {
       await new Promise((resolve) => setTimeout(resolve, 0));
     }
     state.tagMarkupIds = added.map((markup) => markup.id).filter(Number.isFinite);
-    setResult(
-      skipped
-        ? `Added ${added.length} tags. ${skipped} more are not tagged yet — filter the list and tag the next set.`
-        : `Added ${added.length} ${currentBrowserLabel().toLowerCase()} tag${added.length === 1 ? "" : "s"}.`,
-      "ok"
-    );
-    log("Browser tags added", { tab: state.activeTab, requested: items.length, markups: added.length, skipped });
+    setResult(`Added ${added.length} ${currentBrowserLabel().toLowerCase()} tag${added.length === 1 ? "" : "s"}.`, "ok");
+    log("Browser tags added", { tab: state.activeTab, requested: items.length, markups: added.length });
   } catch (error) {
     setResult("Couldn't add the current-list tags. Check Advanced → Debug log.", "error");
     log("Browser tagging failed", error.message);
