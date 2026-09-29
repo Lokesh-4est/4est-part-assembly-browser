@@ -86,6 +86,14 @@ function flattenRuntimeIds(items) {
   });
 }
 
+async function getSelectedModelObjectIds() {
+  const selection = await API.viewer.getSelection();
+  return (selection || []).map((model) => ({
+    modelId: model.modelId,
+    objectRuntimeIds: uniqueIds(model.objectRuntimeIds || [])
+  })).filter((model) => model.modelId && model.objectRuntimeIds.length);
+}
+
 async function getAllModelObjectIds() {
   try {
     const objects = await API.viewer.getObjects({});
@@ -110,11 +118,7 @@ async function getAllModelObjectIds() {
   } catch (error) { log("getModels() failed", error.message); }
 
   try {
-    const selection = await API.viewer.getSelection();
-    return (selection || []).map((model) => ({
-      modelId: model.modelId,
-      objectRuntimeIds: uniqueIds(model.objectRuntimeIds || [])
-    })).filter((model) => model.modelId && model.objectRuntimeIds.length);
+    return await getSelectedModelObjectIds();
   } catch (error) { log("getSelection() fallback failed", error.message); return []; }
 }
 
@@ -133,7 +137,7 @@ function mapPropertyValues(object, modelId, maps) {
   }
 }
 
-async function refreshModel() {
+async function refreshModel(useSelection = false) {
   if (!API) return;
   el("loadingState").hidden = false;
   el("emptyState").hidden = true;
@@ -141,7 +145,14 @@ async function refreshModel() {
   setResult();
   clearPartialResults();
 
-  const modelObjects = await getAllModelObjectIds();
+  let modelObjects = [];
+  if (useSelection) {
+    try { modelObjects = await getSelectedModelObjectIds(); }
+    catch (error) { log("Selection read failed; refreshing complete model", error.message); }
+  }
+  const selectedOnly = modelObjects.length > 0;
+  if (!selectedOnly) modelObjects = await getAllModelObjectIds();
+  const scope = selectedOnly ? "selected objects" : "complete model";
   const total = modelObjects.reduce((sum, model) => sum + model.objectRuntimeIds.length, 0);
   if (!total) {
     el("loadingState").hidden = true;
@@ -149,6 +160,7 @@ async function refreshModel() {
     el("emptyState").textContent = "Couldn't read any objects from the complete model. Check Advanced → Debug log.";
     return;
   }
+  el("loadingText").textContent = `Reading ${scope}…`;
 
   const maps = { assembly: new Map(), part: new Map(), uniqueId: new Map() };
   let completed = 0;
@@ -160,7 +172,7 @@ async function refreshModel() {
         for (const object of objects || []) mapPropertyValues(object, modelId, maps);
       } catch (error) { log(`Property read failed for ${modelId}, batch ${index}`, error.message); }
       completed += batch.length;
-      el("loadingText").textContent = `Reading complete model… (${completed}/${total})`;
+      el("loadingText").textContent = `Reading ${scope}… (${completed}/${total})`;
     }
   }
 
@@ -170,7 +182,8 @@ async function refreshModel() {
   state.uniqueIds = [...maps.uniqueId].map(([value, entries]) => ({ value, entries })).sort((a, b) => naturalCompare(a.value, b.value));
   el("loadingState").hidden = true;
   renderBrowser();
-  log("Model browser refreshed", { objects: completed, assemblies: state.assemblies.length, parts: state.parts.length, uniqueIds: state.uniqueIds.length });
+  if (selectedOnly) setResult(`Showing browser values for ${total} selected object${total === 1 ? "" : "s"}.`, "ok");
+  log("Model browser refreshed", { scope, objects: completed, assemblies: state.assemblies.length, parts: state.parts.length, uniqueIds: state.uniqueIds.length });
 }
 
 function getGroupKey(value) {
@@ -737,7 +750,7 @@ function setupUI() {
     el("filterInput").value = ""; renderBrowser();
   }));
   el("filterInput").addEventListener("input", renderBrowser);
-  el("refreshButton").addEventListener("click", refreshModel);
+  el("refreshButton").addEventListener("click", () => refreshModel(true));
   el("colourGroupsButton").addEventListener("click", colourVisibleGroups);
   el("tagButton").addEventListener("click", tagCurrentList);
   el("deleteMarkupsButton").addEventListener("click", deleteAllMarkups);
